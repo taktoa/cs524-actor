@@ -1,356 +1,455 @@
 --------------------------------------------------------------------------------
 
-{-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE ExistentialQuantification  #-}
+{-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GADTSyntax                 #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE StandaloneDeriving         #-}
+{-# LANGUAGE TypeFamilies               #-}
 
 --------------------------------------------------------------------------------
 
 -- |
--- Module      :  Control.Concurrent.Actor
--- Copyright   :  (c) 2011 Alex Constandache
--- License     :  BSD3
--- Maintainer  :  alexander.the.average@gmail.com
--- Stability   :  alpha
--- Portability :  GHC only (requires throwTo)
+--   Module      :  Control.Concurrent.Actor
+--   Copyright   :  © 2017 Remy Goldschmidt
+--   License     :  Apache-2.0
+--   Maintainer  :  taktoa@gmail.com
+--   Stability   :  alpha
 --
--- This module implements Erlang-style actors
--- (what Erlang calls processes). It does not implement
--- network distribution (yet?). Here is an example:
+--   This module implements actor model concurrency on top of the 'MonadConc'
+--   class from <https://hackage.haskell.org/package/concurrency concurrency>.
 --
+--   The API described below was inspired by the
+--   <https://hackage.haskell.org/package/thespian thespian> package,
+--   but it improves on that API in the following ways:
+--     * It has stronger type safety for the messages sent between actors.
+--     * It has a built-in notion of actor state, which is useful for
+--       implementing
 --
--- > act1 :: ActorM ()
--- > act1 = do
--- >     me <- self
--- >     liftIO $ print "act1 started"
--- >     forever $ receive
--- >       [ Case $ \((n, a) :: (Int, Address)) ->
--- >             if n > 10000
--- >                 then do
--- >                     liftIO . throwIO $ NonTermination
--- >                 else do
--- >                     liftIO . putStrLn $ "act1 got " ++ show n ++ " from " ++ show a
--- >                     send a (n+1, me)
--- >       , Case $ \(e :: RemoteException) ->
--- >             liftIO . print $ "act1 received a remote exception"
--- >       , Default $ liftIO . print $ "act1: received a malformed message"
--- >       ]
--- >
--- > act2 :: Address -> ActorM ()
--- > act2 addr = do
--- >     monitor addr
--- >     -- setFlag TrapRemoteExceptions
--- >     me <- self
--- >     send addr (0 :: Int, me)
--- >     forever $ receive
--- >       [ Case $ \((n, a) :: (Int, Address)) -> do
--- >                     liftIO . putStrLn $ "act2 got " ++ (show n) ++ " from " ++ (show a)
--- >                     send a (n+1, me)
--- >       , Case $ \(e :: RemoteException) ->
--- >             liftIO . print $ "act2 received a remote exception: " ++ (show e)
--- >       ]
--- >
--- > act3 :: Address -> ActorM ()
--- > act3 addr = do
--- >     monitor addr
--- >     setFlag TrapRemoteExceptions
--- >     forever $ receive
--- >       [ Case $ \(e :: RemoteException) ->
--- >             liftIO . print $ "act3 received a remote exception: " ++ (show e)
--- >       ]
--- >
--- > main = do
--- >     addr1 <- spawn act1
--- >     addr2 <- spawn (act2 addr1)
--- >     spawn (act3 addr2)
--- >     threadDelay 20000000
-module Control.Concurrent.Actor
-  ( -- * Types
-    Address
-  , Handler (..)
-  , ActorM
-  , RemoteException
-  , ActorExitNormal
-  , Flag (..)
+--   FIXME: add an example
+module Actor
+  ( -- * The @ActorT@ monad transformer
+    ActorT
+  , mapActorT
 
-    -- * Actor actions
-  , send
-  , self
-  , receive
-  , receiveWithTimeout
+    -- * Actor spawning and addresses
+  , Address
+  , mapAddress
   , spawn
-  , monitor
-  , link
-  , setFlag
-  , clearFlag
-  , toggleFlag
-  , testFlag
+  , self
+
+    -- * Sending and receiving
+  , send
+  , receive
+
+    -- * Modifying actor state
+  , get
+  , put
+  , state
+  , modify
+  , embedStateT
+  , embedST
   ) where
 
 --------------------------------------------------------------------------------
 
-import           Control.Monad.IO.Class     (MonadIO (liftIO))
-import           Data.Word                  (Word64)
-import           System.Timeout             (timeout)
+-- MTL-style typeclasses
 
-import qualified Control.Concurrent         as Conc
+import           Control.Monad.IO.Class         (MonadIO)
+import qualified Control.Monad.IO.Class         as MonadIO
 
-import           Control.Concurrent.Chan    (Chan)
-import qualified Control.Concurrent.Chan    as Chan
+import           Control.Monad.Trans.Class      (MonadTrans)
+import qualified Control.Monad.Trans.Class      as MonadTrans
 
-import           Control.Concurrent.MVar    (MVar)
-import qualified Control.Concurrent.MVar    as MVar
+import           Control.Monad.State.Class      (MonadState)
+import qualified Control.Monad.State.Class      as MonadState
 
-import           Control.Exception          (Exception, catches)
-import qualified Control.Exception          as Exception
+import           Control.Monad.Conc.Class       (MonadConc)
+import qualified Control.Monad.Conc.Class       as MonadConc
 
-import qualified Data.Bits                  as Bits
+import           Control.Monad.Catch            (MonadThrow)
+import qualified Control.Monad.Catch            as MonadThrow
 
-import           Control.Monad.Trans.Reader (ReaderT)
-import qualified Control.Monad.Trans.Reader as ReaderT
+import           Control.Monad.Catch            (MonadCatch)
+import qualified Control.Monad.Catch            as MonadCatch
 
-import           Data.Dynamic               (Dynamic)
-import qualified Data.Dynamic               as Dynamic
-
-import           Data.Typeable              (Typeable)
-
-import           Data.Set                   (Set)
-import qualified Data.Set                   as Set
-
-import           Flow                       ((.>), (|>))
+import           Control.Monad.Catch            (MonadMask)
+import qualified Control.Monad.Catch            as MonadMask
 
 --------------------------------------------------------------------------------
 
--- | Exception raised by an actor on exit
-data ActorExitNormal
-  = ActorExitNormal
-  deriving (Show)
+-- Other typeclasses
 
-instance Exception ActorExitNormal
+import           Data.Typeable                  (Typeable)
 
-data RemoteException
-  = RemoteException Address Exception.SomeException
-  deriving (Show)
+--------------------------------------------------------------------------------
 
-instance Exception RemoteException
+-- Monads and monad transformers
 
-type Flags = Word64
+import           Control.Monad.ST               (ST)
+import qualified Control.Monad.ST               as ST
 
-data Flag
-  = TrapRemoteExceptions
-  deriving (Eq, Enum)
+import           Control.Monad.Trans.State      (StateT)
+import qualified Control.Monad.Trans.State      as StateT
 
-defaultFlags :: [Flag]
-defaultFlags = []
+import           Control.Monad.Trans.Reader     (ReaderT)
+import qualified Control.Monad.Trans.Reader     as ReaderT
 
-setF :: Flag -> Flags -> Flags
-setF = flip Bits.setBit . fromEnum
+--------------------------------------------------------------------------------
 
-clearF :: Flag -> Flags -> Flags
-clearF = flip Bits.clearBit . fromEnum
+-- Data types
 
-toggleF :: Flag -> Flags -> Flags
-toggleF = flip Bits.complementBit . fromEnum
+import           Data.STRef                     (STRef)
+import qualified Data.STRef                     as STRef
 
-isSetF :: Flag -> Flags -> Bool
-isSetF = flip Bits.testBit . fromEnum
+import           Control.Concurrent.Classy.Chan (Chan)
+import qualified Control.Concurrent.Classy.Chan as Chan
 
-data Context
+import           Control.Concurrent.Classy.MVar (MVar)
+import qualified Control.Concurrent.Classy.MVar as MVar
+
+--------------------------------------------------------------------------------
+
+-- Other stuff
+
+import qualified Control.Lens                   as Lens
+
+import           Control.Monad                  (forever, (>=>))
+
+import           Flow                           ((.>), (|>))
+
+--------------------------------------------------------------------------------
+
+-- class (Monad m, MonadState s m) => MonadActor (s :: *) (m :: * -> *) where
+--   type ActorAddress m :: *
+--   type ActorState   m :: *
+--   type ActorMessage m :: *
+--   send    :: ActorAddress m -> ActorMessage m -> m ()
+--   receive :: (ActorMessage m -> m ()) -> m ()
+
+--------------------------------------------------------------------------------
+
+-- | A Kleisli-flavored isomorphism between two types.
+--
+--   A value of type @'KIso' m a b@ is equivalent in some sense to a value
+--   of type @(a -> m b, b -> m a)@.
+type KIso m a b = Lens.Iso a (m a) (m b) b
+
+-- | This type is used when a function should take a 'KIso' as an argument.
+type AKIso m a b = Lens.AnIso a (m a) (m b) b
+
+-- | Create a 'KIso' from a pair of effectful conversion functions.
+kiso :: (a -> m b) -> (b -> m a) -> KIso m a b
+kiso = Lens.iso
+
+-- | FIXME: doc
+kisoPure :: (Applicative m) => Lens.Iso' a b -> KIso m a b
+kisoPure optic = Lens.withIso optic $ \f g -> kiso (f .> pure) (g .> pure)
+
+-- | Flip a 'KIso' around.
+--
+--   If you think of 'KIso's as pairs, this would be @\(x, y) -> (y, x)@.
+kisoFlip :: AKIso m a b -> KIso m b a
+kisoFlip = Lens.from
+
+-- | View a value through a 'KIso' forwards (i.e.: access the @a -> m b@).
+kisoProview :: AKIso m a b -> a -> m b
+kisoProview optic value = Lens.withIso optic $ \f _ -> f value
+
+-- | View a value through a 'KIso' backwards (i.e.: access the @b -> m a@).
+kisoConview :: AKIso m a b -> b -> m a
+kisoConview optic value = Lens.withIso optic $ \_ g -> g value
+
+--------------------------------------------------------------------------------
+
+-- This datatype contains any values that an actor needs access to during
+-- execution.
+data Context st message monad
   = Context
-    { contextLSet  :: MVar (Set Address)
-    , contextChan  :: Chan Message
-    , contextFlags :: MVar Flags
+    { contextSend :: !(message -> monad ())
+    , contextRecv :: !(monad message)
+    , contextPut  :: !(st -> monad ())
+    , contextGet  :: !(monad st)
     }
-  deriving ()
-
---------------------------------------------------------------------------------
-
-newtype Message
-  = Message Dynamic
-  deriving ()
-
-instance Show Message where
-    show (Message dyn) = show dyn
-
-toMessage :: (Typeable a) => a -> Message
-toMessage = Dynamic.toDyn .> Message
-
-fromMessage :: (Typeable a) => Message -> Maybe a
-fromMessage = (\(Message dyn) -> dyn) .> Dynamic.fromDynamic
 
 --------------------------------------------------------------------------------
 
 -- | The address of an actor, used to send messages
-data Address
+data Address message monad
   = Address
-    { addressThreadId :: Conc.ThreadId
-    , addressContext  :: Context
+    { addressThreadId :: !(MonadConc.ThreadId monad)
+    , addressSend     :: !(message -> monad ())
     }
-  deriving ()
 
-instance Show Address where
-  show (Address tid _) = "Address(" ++ show tid ++ ")"
-
-instance Eq Address where
+instance (Eq (MonadConc.ThreadId monad)) => Eq (Address message monad) where
   addr1 == addr2 = let tid1 = addressThreadId addr1
                        tid2 = addressThreadId addr2
                    in tid1 == tid2
 
-instance Ord Address where
+instance (Ord (MonadConc.ThreadId monad)) => Ord (Address message monad) where
   compare addr1 addr2 = let tid1 = addressThreadId addr1
                             tid2 = addressThreadId addr2
                         in compare tid1 tid2
 
+instance (Show (MonadConc.ThreadId monad)) => Show (Address message monad) where
+  show (Address tid _) = "Address(" ++ show tid ++ ")"
+
+-- | FIXME: doc
+mapAddress
+  :: (Monad monad)
+  => (messageB -> monad messageA)
+  -- ^ FIXME: doc
+  -> Address messageA monad
+  -- ^ FIXME: doc
+  -> Address messageB monad
+  -- ^ FIXME: doc
+mapAddress f (Address tid s) = Address tid (f >=> s)
+
 --------------------------------------------------------------------------------
 
--- | The actor monad, just a reader monad on top of 'IO'.
-newtype ActorM a
-  = ActorM (ReaderT Context IO a)
-  deriving (Functor, Applicative, Monad, MonadIO)
+
+-- | The actor monad transformer.
+--
+--   The @st@ type parameter represents the underlying state of the actor.
+--
+--   The @message@ type parameter represents the type of messages that can be
+--   received by this actor.
+--
+--   The @monad@ type parameter represents the underlying monad for this
+--   monad transformer. In most cases this will need to have a 'MonadConc'
+--   instance at the very least. In production, this will probably be 'IO'.
+newtype ActorT st message monad ret
+  = ActorT (ReaderT (Context st message monad) monad ret)
+
+deriving instance (Functor     monad) => Functor     (ActorT st message monad)
+deriving instance (Applicative monad) => Applicative (ActorT st message monad)
+deriving instance (Monad       monad) => Monad       (ActorT st message monad)
+deriving instance (MonadIO     monad) => MonadIO     (ActorT st message monad)
+deriving instance (MonadThrow  monad) => MonadThrow  (ActorT st message monad)
+deriving instance (MonadCatch  monad) => MonadCatch  (ActorT st message monad)
+deriving instance (MonadMask   monad) => MonadMask   (ActorT st message monad)
+
+-- | Uses the 'MonadTrans' instance of the underlying 'ReaderT' transformer.
+instance MonadTrans (ActorT st message) where
+  lift action = ActorT (MonadTrans.lift action)
+
+-- | Allows easy use of the actor state variable.
+instance (MonadConc monad) => MonadState st (ActorT st message monad) where
+  get = do
+    m <- contextGet <$> ActorT ReaderT.ask
+    MonadTrans.lift m
+  put value = do
+    f <- contextPut <$> ActorT ReaderT.ask
+    MonadTrans.lift (f value)
+
+-- | Given the following:
+--     1. An effectful isomorphism ('KIso') between two state types
+--        @stA@ and @stB@.
+--     2. An effectful isomorphism between two message types
+--        @messageA@ and @messageB@.
+--   this will convert an @'ActorT' stA messageA monad ret@
+--   to an @'ActorT' stB messageB monad ret@.
+--
+--   For a concrete example, suppose that
+--   @new = 'mapActorT' ('kiso' stF stG) ('kiso' messageF messageG) old@.
+--
+--   Then the following will be true:
+--     * Whenever @old@ uses 'send', @messageF@ is used in @new@ to convert
+--       the old message type to the new message type.
+--     * Whenever @old@ uses 'receive', @messageG@ is used in @new@ to convert
+--       the new message type back to the old message type.
+--     * Whenever @old@ uses 'put', @messageF@ is used in @new@ to convert
+--       the old message type to the new message type.
+--     * Whenever @old@ uses 'get', @messageG@ is used in @new@ to convert
+--       the new message type back to the old message type.
+mapActorT
+  :: (Monad monad)
+  => KIso monad stA stB
+  -- ^ An effectful isomorphism between @stA@ and @stB@.
+  -> KIso monad messageA messageB
+  -- ^ An effectful isomorphism between @messageA@ and @messageB@.
+  -> ActorT stA messageA monad ret
+  -- ^ An 'ActorT' action with @stA@ as its state type, @messageA@ as its
+  --   message type, and @ret@ as its return value.
+  -> ActorT stB messageB monad ret
+  -- ^ An 'ActorT' action with @stB@ as its state type, @messageB@ as its
+  --   message type, and @ret@ as its return value.
+mapActorT stIso messageIso (ActorT m) = ActorT $ do
+  let mapContext (Context s r p g) = Context
+                                     (kisoProview messageIso >=> s)
+                                     (r >>= kisoConview messageIso)
+                                     (kisoProview stIso >=> p)
+                                     (g >>= kisoConview stIso)
+  ReaderT.withReaderT mapContext m
 
 --------------------------------------------------------------------------------
 
-data Handler where
-  Case    :: (Typeable m) => (m -> ActorM ()) -> Handler
-  Default ::                 ActorM ()        -> Handler
+-- | Spawns a new actor with the given initial state and returns its 'Address'.
+spawn
+  :: (MonadConc monad)
+  => st
+  -- ^ The initial actor state.
+  -> ActorT st message monad ()
+  -- ^ The actor to run.
+  -> monad (Address message monad)
+  -- ^ A concurrent action that spawns the actor and returns its 'Address'.
+spawn initial (ActorT act) = do
+  chan     <- Chan.newChan
+  stateVar <- MVar.newMVar initial
+  let ctx = Context { contextSend = Chan.writeChan chan
+                    , contextRecv = Chan.readChan  chan
+                    , contextPut  = MVar.putMVar   stateVar
+                    , contextGet  = MVar.readMVar  stateVar
+                    }
+  tid <- MonadConc.fork (ReaderT.runReaderT act ctx)
+  pure (Address tid (contextSend ctx))
 
 --------------------------------------------------------------------------------
 
--- | Used to obtain an actor's own address inside the actor
-self :: ActorM Address
+-- | Used to obtain the address of an actor while inside the actor.
+self
+  :: (MonadConc monad)
+  => ActorT st message monad (Address message monad)
+  -- ^ An 'ActorT' action that returns the address of the current actor.
 self = do
-  c <- ActorM ReaderT.ask
-  i <- liftIO Conc.myThreadId
-  pure $ Address i c
+  s <- ActorT (ReaderT.asks contextSend)
+  tid <- MonadTrans.lift MonadConc.myThreadId
+  pure (Address tid s)
 
 --------------------------------------------------------------------------------
 
--- | Try to handle a message using a list of handlers.
--- The first handler matching the type of the message
--- is used.
-receive :: [Handler] -> ActorM ()
-receive hs = do
-  ch <- ActorM (ReaderT.asks contextChan)
-  msg <- liftIO (Chan.readChan ch)
-  receiveHelper msg hs
-
--- | Same as receive, but times out after a specified
--- amount of time and runs a default action
-receiveWithTimeout :: Int -> [Handler] -> ActorM () -> ActorM ()
-receiveWithTimeout n hs act = do
-  ch <- ActorM (ReaderT.asks contextChan)
-  liftIO (timeout n (Chan.readChan ch))
-    >>= maybe act (\m -> receiveHelper m hs)
-
-receiveHelper :: Message -> [Handler] -> ActorM ()
-receiveHelper msg = go
-  where
-    go []       = liftIO patMatchFail
-    go (h : hs) = case h of
-                    (Case cb)     -> maybe (go hs) cb (fromMessage msg)
-                    (Default act) -> act
-
-    patMatchFail = mconcat ["no handler for messages of type ", show msg]
-                   |> Exception.PatternMatchFail
-                   |> Exception.throwIO
+-- | Try to handle an incoming message using a function.
+--
+--   This will block until a new message comes in, at which point the behavior
+--   of the actor will become the result of running the given function on the
+--   received message.
+receive
+  :: (MonadConc monad)
+  => (message -> ActorT st message monad ())
+  -- ^ A message handler function.
+  -> ActorT st message monad ()
+  -- ^ An 'ActorT' action that blocks until there is at least one message
+  --   in the actor mailbox, and then handles one of the mailbox messages
+  --   using the given handler function.
+receive handler = do
+  r <- ActorT (ReaderT.asks contextRecv)
+  MonadTrans.lift r >>= handler
 
 --------------------------------------------------------------------------------
 
--- | Sends a message from inside the 'ActorM' monad
-send :: Typeable m => Address -> m -> ActorM ()
-send addr msg = do
-  let ch = contextChan $ addressContext addr
-  liftIO $ Chan.writeChan ch $ toMessage msg
+-- | Sends the given message to the actor at the given address.
+send
+  :: (MonadConc monad)
+  => Address message monad
+  -- ^ The address of the actor to which the message will be sent.
+  -> message
+  -- ^ The message to send.
+  -> ActorT st message monad ()
+  -- ^ An 'ActorT' action that sends the given message to the actor described
+  --   by the given address.
+send addr msg = MonadTrans.lift $ addressSend addr msg
 
 --------------------------------------------------------------------------------
 
--- | Spawn a new actor with default flags
-spawn :: ActorM () -> IO Address
-spawn = spawn' defaultFlags
+-- | Return the state from the internals of the monad.
+--
+--   This function is the same as 'MonadState.get' from
+--   "Control.Monad.State.Class", except it has a more specific type.
+get
+  :: (MonadConc monad)
+  => ActorT st message monad st
+  -- ^ An 'ActorT' action that returns the current actor state.
+get = MonadState.get
 
--- | Spawns a new actor, with the given flags set
-spawn' :: [Flag] -> ActorM () -> IO Address
-spawn' fs (ActorM act) = do
-  ch <- liftIO Chan.newChan
-  ls <- MVar.newMVar Set.empty
-  fl <- MVar.newMVar (foldl (flip setF) 0x00 fs)
-  let ctx = Context ls ch fl
-  let orig = do ReaderT.runReaderT act ctx
-                Exception.throwIO ActorExitNormal
-  let wrap :: IO ()
-      wrap = orig `catches` [ Exception.Handler remoteExH
-                            , Exception.Handler someExH ]
-      remoteExH :: RemoteException -> IO ()
-      remoteExH e@(RemoteException a _) = do
-        MVar.modifyMVar_ ls (Set.delete a .> pure)
-        me <- Conc.myThreadId
-        let se = Exception.toException e
-        forward (RemoteException (Address me ctx) se)
-      someExH :: Exception.SomeException -> IO ()
-      someExH e = do
-        me <- Conc.myThreadId
-        forward (RemoteException (Address me ctx) e)
-      forward :: RemoteException -> IO ()
-      forward ex = do
-        lset <- MVar.withMVar ls pure
-        mapM_ (fwdaux ex) (Set.elems lset)
-      fwdaux :: RemoteException -> Address -> IO ()
-      fwdaux ex addr = do
-        let rfs = contextFlags (addressContext addr)
-        let rch = contextChan  (addressContext addr)
-        trap <- MVar.withMVar rfs (pure . isSetF TrapRemoteExceptions)
-        if trap
-          then Chan.writeChan rch (toMessage ex)
-          else Exception.throwTo (addressThreadId addr) ex
-  tid <- Conc.forkIO wrap
-  pure (Address tid ctx)
+-- | Replace the state inside the monad.
+--
+--   This function is the same as 'MonadState.put' from
+--   "Control.Monad.State.Class", except it has a more specific type.
+put
+  :: (MonadConc monad)
+  => st
+  -- ^ The new state to which the actor state will be set.
+  -> ActorT st message monad ()
+  -- ^ An 'ActorT' action that sets the actor state to the new state.
+put = MonadState.put
 
---------------------------------------------------------------------------------
+-- | Embed a simple state action into the monad.
+--
+--   This function is the same as 'MonadState.state' from
+--   "Control.Monad.State.Class", except it has a more specific type.
+state
+  :: (MonadConc monad)
+  => (st -> (ret, st))
+  -- ^ A function that, given the current state, returns an arbitrary value
+  --   along with a new state.
+  -> ActorT st message monad ret
+  -- ^ An 'ActorT' action that runs the function on the current state,
+  --   sets the actor state to the new state, and returns the arbitrary
+  --   value.
+state = MonadState.state
 
--- | Monitors the actor at the specified address.
--- If an exception is raised in the monitored actor's
--- thread, it is wrapped in an 'ActorException' and
--- forwarded to the monitoring actor. If the monitored
--- actor terminates, an 'ActorException' is raised in
--- the monitoring actor.
-monitor :: Address -> ActorM ()
-monitor addr = do
-  me <- self
-  let ls = contextLSet (addressContext addr)
-  liftIO $ MVar.modifyMVar_ ls (Set.insert me .> pure)
+-- | Maps an old state to a new state inside a state monad.
+--   The old state is thrown away.
+--
+--   This function is the same as 'MonadState.modify' from
+--   "Control.Monad.State.Class", except it has a more specific type.
+modify
+  :: (MonadConc monad)
+  => (st -> st)
+  -- ^ A function from the state type to itself.
+  -> ActorT st message monad ()
+  -- ^ An 'ActorT' action that replaces the state with the result of
+  --   running the given function on the old state.
+modify = MonadState.modify
 
--- | Like `monitor`, but bi-directional
-link :: Address -> ActorM ()
-link addr = do
-  monitor addr
-  ls <- ActorM (ReaderT.asks contextLSet)
-  liftIO $ MVar.modifyMVar_ ls (Set.insert addr .> pure)
+-- | Convert a 'StateT' state transformer value to an 'ActorT' action that
+--   modifies the actor state using the state transformer.
+embedStateT
+  :: (MonadConc monad)
+  => StateT st monad ret
+  -- ^ A monadic state transformer.
+  -> ActorT st message monad ret
+  -- ^ An 'ActorT' action that modifies the actor state using the
+  --   given state transformer.
+embedStateT action = do
+  s <- MonadState.get
+  (ret, s') <- MonadTrans.lift (StateT.runStateT action s)
+  MonadState.put s'
+  pure ret
 
---------------------------------------------------------------------------------
-
--- | Sets the specified flag in the actor's environment
-setFlag :: Flag -> ActorM ()
-setFlag flag = do
-  fs <- ActorM (ReaderT.asks contextFlags)
-  liftIO $ MVar.modifyMVar_ fs (setF flag .> pure)
-
--- | Clears the specified flag in the actor's environment
-clearFlag :: Flag -> ActorM ()
-clearFlag flag = do
-  fs <- ActorM (ReaderT.asks contextFlags)
-  liftIO $ MVar.modifyMVar_ fs (clearF flag .> pure)
-
--- | Toggles the specified flag in the actor's environment
-toggleFlag :: Flag -> ActorM ()
-toggleFlag flag = do
-  fs <- ActorM (ReaderT.asks contextFlags)
-  liftIO $ MVar.modifyMVar_ fs (toggleF flag .> pure)
-
--- | Checks if the specified flag is set in the actor's environment
-testFlag :: Flag -> ActorM Bool
-testFlag flag = do
-  fs <- ActorM (ReaderT.asks contextFlags)
-  liftIO $ MVar.withMVar fs (isSetF flag .> pure)
+-- | Given a function @f@ from an @'STRef' s st@ to an @'ST' s ret@ action,
+--   produce an @'ActorT' st message m ret@ action that does the following:
+--
+--     1. It gets the current actor state, and saves it to @s@.
+--     2. It runs an 'ST' action that does the following:
+--         1. It creates an 'STRef' called @var@ that is initialized to @s@.
+--         2. It runs @f var@, saving the result to @ret@.
+--         3. It reads @var@, saving the result to @s'@.
+--         4. It returns @(ret, s')@
+--     3. The result of step 2 is saved to @(ret, s')@.
+--     4. The actor state is set to @s'@.
+--     5. Finally, @ret@ is returned.
+embedST
+  :: (MonadConc monad)
+  => (forall s. STRef s st -> ST s ret)
+  -- ^ An 'ST' action that can mutate the given 'STRef' and return an
+  --   arbitrary value.
+  -> ActorT st message monad ret
+  -- ^ An 'ActorT' action that uses the 'ST' action to mutate the actor
+  --   state, and then returns the arbitrary value produced by the 'ST'
+  --   action.
+embedST f = do
+  s <- MonadState.get
+  (ret, s') <- pure $ ST.runST $ do
+    var <- STRef.newSTRef s
+    ret <- f var
+    s' <- STRef.readSTRef var
+    pure (ret, s')
+  MonadState.put s'
+  pure ret
 
 --------------------------------------------------------------------------------
