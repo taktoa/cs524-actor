@@ -35,21 +35,21 @@ eager :: forall m. (MonadConc m) => (Int -> m ()) -> m ()
 eager printInt = void $ do
   let viewer :: ActorT () Int m ()
       viewer = forever $ do
-        ActorT.receive $ \m -> do
+        ActorT.recv $ \m -> do
           MonadTrans.lift (printInt m)
   viewerAddr <- ActorT.spawn () viewer
   let sender :: ActorT Bool Int m ()
       sender = do
-        ActorT.receive $ \m -> do
+        ActorT.recv $ \m -> do
           ActorT.send viewerAddr m
           first <- ActorT.get
           if first
             then ActorT.put False >> sender
-            else forever (ActorT.receive (\_ -> pure ()))
+            else forever (ActorT.recv (\_ -> pure ()))
   senderAddr <- ActorT.spawn True sender
   let recep :: ActorT () Int m ()
       recep = forever $ do
-        ActorT.receive $ \m -> do
+        ActorT.recv $ \m -> do
           ActorT.send senderAddr m
           ActorT.send senderAddr m
   ActorT.spawn () recep
