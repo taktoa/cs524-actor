@@ -59,68 +59,68 @@ module Actor
 
 -- MTL-style typeclasses
 
-import           Control.Monad.IO.Class         (MonadIO)
-import qualified Control.Monad.IO.Class         as MonadIO
+import           Control.Monad.IO.Class           (MonadIO)
+import qualified Control.Monad.IO.Class           as MonadIO
 
-import           Control.Monad.Trans.Class      (MonadTrans)
-import qualified Control.Monad.Trans.Class      as MonadTrans
+import           Control.Monad.Trans.Class        (MonadTrans)
+import qualified Control.Monad.Trans.Class        as MonadTrans
 
-import           Control.Monad.State.Class      (MonadState)
-import qualified Control.Monad.State.Class      as MonadState
+import           Control.Monad.State.Class        (MonadState)
+import qualified Control.Monad.State.Class        as MonadState
 
-import           Control.Monad.Conc.Class       (MonadConc)
-import qualified Control.Monad.Conc.Class       as MonadConc
+import           Control.Monad.Conc.Class         (MonadConc)
+import qualified Control.Monad.Conc.Class         as MonadConc
 
-import           Control.Monad.Catch            (MonadThrow)
-import qualified Control.Monad.Catch            as MonadThrow
+import           Control.Monad.Catch              (MonadThrow)
+import qualified Control.Monad.Catch              as MonadThrow
 
-import           Control.Monad.Catch            (MonadCatch)
-import qualified Control.Monad.Catch            as MonadCatch
+import           Control.Monad.Catch              (MonadCatch)
+import qualified Control.Monad.Catch              as MonadCatch
 
-import           Control.Monad.Catch            (MonadMask)
-import qualified Control.Monad.Catch            as MonadMask
+import           Control.Monad.Catch              (MonadMask)
+import qualified Control.Monad.Catch              as MonadMask
 
 --------------------------------------------------------------------------------
 
 -- Other typeclasses
 
-import           Data.Typeable                  (Typeable)
+import           Data.Typeable                    (Typeable)
 
 --------------------------------------------------------------------------------
 
 -- Monads and monad transformers
 
-import           Control.Monad.ST               (ST)
-import qualified Control.Monad.ST               as ST
+import           Control.Monad.ST                 (ST)
+import qualified Control.Monad.ST                 as ST
 
-import           Control.Monad.Trans.State      (StateT)
-import qualified Control.Monad.Trans.State      as StateT
+import           Control.Monad.Trans.State.Strict (StateT)
+import qualified Control.Monad.Trans.State.Strict as StateT
 
-import           Control.Monad.Trans.Reader     (ReaderT)
-import qualified Control.Monad.Trans.Reader     as ReaderT
+import           Control.Monad.Trans.Reader       (ReaderT)
+import qualified Control.Monad.Trans.Reader       as ReaderT
 
 --------------------------------------------------------------------------------
 
 -- Data types
 
-import           Data.STRef                     (STRef)
-import qualified Data.STRef                     as STRef
+import           Data.STRef                       (STRef)
+import qualified Data.STRef                       as STRef
 
-import           Control.Concurrent.Classy.Chan (Chan)
-import qualified Control.Concurrent.Classy.Chan as Chan
+import           Control.Concurrent.Classy.Chan   (Chan)
+import qualified Control.Concurrent.Classy.Chan   as Chan
 
-import           Control.Concurrent.Classy.MVar (MVar)
-import qualified Control.Concurrent.Classy.MVar as MVar
+import           Control.Concurrent.Classy.MVar   (MVar)
+import qualified Control.Concurrent.Classy.MVar   as MVar
 
 --------------------------------------------------------------------------------
 
 -- Other stuff
 
-import qualified Control.Lens                   as Lens
+import qualified Control.Lens                     as Lens
 
-import           Control.Monad                  (forever, (>=>))
+import           Control.Monad                    (forever, (>=>))
 
-import           Flow                           ((.>), (|>))
+import           Flow                             ((.>), (|>))
 
 --------------------------------------------------------------------------------
 
@@ -141,10 +141,13 @@ class ( Monad m, MonadState st m, MonadConc (C m)
   self :: m (Addr m)
 
   -- | FIXME: doc
+  selfTID :: m (MonadConc.ThreadId m)
+
+  -- | FIXME: doc
   send :: Addr m -> msg -> m ()
 
   -- | FIXME: doc
-  recv :: (msg -> m a) -> m a
+  recv :: (msg -> m a) -> m ()
 
 --------------------------------------------------------------------------------
 
@@ -187,9 +190,9 @@ instance (MonadConc m) => MonadState st (ActorT st msg m) where
     MonadTrans.lift (MVar.putMVar var value)
 
 -- | The 'ActorT' monad is, of course, an instance of 'MonadActor'.
-instance (MonadConc m) => MonadActor state msg (ActorT state msg m) where
-  type Addr (ActorT state msg m) = Mailbox msg m
-  type C    (ActorT state msg m) = m
+instance (MonadConc m) => MonadActor st msg (ActorT st msg m) where
+  type Addr (ActorT st msg m) = Mailbox msg m
+  type C    (ActorT st msg m) = m
 
   spawn initial (ActorT act) = do
     chan     <- Chan.newChan
@@ -205,12 +208,15 @@ instance (MonadConc m) => MonadActor state msg (ActorT state msg m) where
     tid <- MonadTrans.lift MonadConc.myThreadId
     pure (Mailbox tid (Chan.writeChan chan))
 
+  selfTID = MonadTrans.lift MonadConc.myThreadId
+
   send addr msg = do
     MonadTrans.lift $ mailboxSend addr msg
 
   recv handler = do
     chan <- ActorT (ReaderT.asks contextChan)
     MonadTrans.lift (Chan.readChan chan) >>= handler
+    pure ()
 
 --------------------------------------------------------------------------------
 

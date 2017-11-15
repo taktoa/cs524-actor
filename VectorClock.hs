@@ -4,8 +4,11 @@
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE FunctionalDependencies     #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE InstanceSigs               #-}
 {-# LANGUAGE KindSignatures             #-}
+{-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE StandaloneDeriving         #-}
 {-# LANGUAGE TypeApplications           #-}
@@ -44,7 +47,7 @@ import qualified Control.Monad.Catch            as MonadMask
 import           Control.Concurrent.Classy.MVar (MVar)
 import qualified Control.Concurrent.Classy.MVar as MVar
 
-import           Control.Monad                  (forever)
+import           Control.Monad                  (forever, void)
 
 import           Data.Map                       (Map)
 import qualified Data.Map                       as Map
@@ -58,9 +61,9 @@ import           Flow                           ((.>), (|>))
 
 --------------------------------------------------------------------------------
 
-class ( MonadActor st msg m, Ord (MonadActor.Addr m)
+class ( MonadActor st msg m
       ) => MonadVC st msg m | m -> st, m -> msg where
-  getClock :: m (VC tid)
+  getClock :: m (VC (MonadConc.ThreadId (MonadActor.C m)))
 
 --------------------------------------------------------------------------------
 
@@ -122,16 +125,35 @@ fromVC (VC m) = m
 
 --------------------------------------------------------------------------------
 
-data WithVC m value
-  = WithVC
-    { vcClock :: !(VC (MonadConc.ThreadId m))
-    , vcValue :: !value
+type TID m = MonadConc.ThreadId m
+
+type MCVC m = VC (MonadConc.ThreadId m)
+
+data VCState m st
+  = VCState
+    { _VCState_clock :: !(MCVC m)
+    , _VCState_state :: !st
+    }
+
+data VCMessageSyncType
+  = VCMessageSyncSYN
+  | VCMessageSyncACK
+
+data VCMessage m msg
+  = VCMessageNormal
+    { _VCMessageNormal_clock   :: !(MCVC m)
+    , _VCMessageNormal_message :: !msg
+    }
+  | VCMessageSync
+    { _VCMessageSync_clock  :: !(MCVC m)
+    , _VCMessageSync_sender :: !(VCMailbox m msg)
+    , _VCMessageSync_type   :: !VCMessageSyncType
     }
 
 --------------------------------------------------------------------------------
 
 newtype VCActorT st msg m ret
-  = VCActorT (ActorT (WithVC m st) (WithVC m msg) m ret)
+  = VCActorT (ActorT (VCState m st) (VCMessage m msg) m ret)
 
 deriving instance (Functor     m) => Functor     (VCActorT st msg m)
 deriving instance (Applicative m) => Applicative (VCActorT st msg m)
@@ -140,100 +162,116 @@ deriving instance (MonadThrow  m) => MonadThrow  (VCActorT st msg m)
 deriving instance (MonadCatch  m) => MonadCatch  (VCActorT st msg m)
 deriving instance (MonadMask   m) => MonadMask   (VCActorT st msg m)
 
+instance MonadTrans (VCActorT st msg) where
+  lift = MonadTrans.lift .> VCActorT
+
 instance (MonadConc m) => MonadState st (VCActorT st msg m) where
-  get = vcValue <$> VCActorT MonadState.get
+  get = _VCState_state <$> VCActorT MonadState.get
   put value = VCActorT $ do
-    WithVC clock _ <- MonadState.get
-    MonadState.put (WithVC clock value)
+    clock <- _VCState_clock <$> MonadState.get
+    MonadState.put (VCState clock value)
 
 instance (MonadConc m) => MonadActor st msg (VCActorT st msg m) where
-  type Addr (VCActorT st msg m) = VCMailbox msg m
+  type Addr (VCActorT st msg m) = VCMailbox m msg
   type C    (VCActorT st msg m) = m
 
   spawn initial (VCActorT act) = do
-    addr <- MonadActor.spawn (WithVC emptyVC initial) act
+    addr <- MonadActor.spawn (VCState emptyVC initial) act
     pure (VCMailbox addr)
 
   self = VCMailbox <$> VCActorT MonadActor.self
 
-  send (VCMailbox addr) msg = VCActorT $ do
-    (WithVC clock state) <- MonadState.get
-    me <- MonadTrans.lift MonadConc.myThreadId
-    let clock' = incrVC me clock
-    MonadState.put (WithVC clock' state)
-    MonadActor.send addr (WithVC clock' msg)
+  send mb msg = internalSend mb (\clock -> VCMessageNormal clock msg)
 
-  recv handler = VCActorT $ MonadActor.recv $ \(WithVC new msg) -> do
-    let compose :: [a -> a] -> (a -> a)
-        compose = map Endo .> mconcat .> appEndo
+  recv :: (msg -> VCActorT st msg m a) -> VCActorT st msg m ()
+  recv cb = internalRecv cb handler
+    where
+      handler :: VCMessage m msg -> (MCVC m, VCActorT st msg m (Maybe msg))
+      handler (VCMessageNormal {..}) = ( _VCMessageNormal_clock
+                                       , ( _VCMessageNormal_message
+                                         ) |> normalHandler
+                                       )
+      handler (VCMessageSync   {..}) = ( _VCMessageSync_clock
+                                       , ( _VCMessageSync_sender
+                                         , _VCMessageSync_type
+                                         ) |> syncHandler
+                                       )
 
-    (WithVC clock state) <- MonadState.get
-    me <- MonadTrans.lift MonadConc.myThreadId
-    let clock' = incrVC me clock
-                 |> compose (updateVC <$> Map.toList (fromVC new))
-    MonadState.put (WithVC clock' state)
+      normalHandler
+        :: msg
+        -> VCActorT st msg m (Maybe msg)
+      normalHandler msg = pure (Just msg)
 
-    (\(VCActorT act) -> act) $ handler msg
+      syncHandler
+        :: (VCMailbox m msg, VCMessageSyncType)
+        -> VCActorT st msg m (Maybe msg)
+      syncHandler (sender, ty) = do
+        case ty of
+          VCMessageSyncACK -> pure ()
+          VCMessageSyncSYN -> do me <- MonadActor.self
+                                 clock <- getClock
+                                 let VCMailbox mb = sender
+                                 VCMessageSync clock me VCMessageSyncACK
+                                   |> MonadActor.send mb
+                                   |> VCActorT
+        pure Nothing
+
+instance (MonadConc m) => MonadVC st msg (VCActorT st msg m) where
+  getClock = _VCState_clock <$> VCActorT MonadState.get
+
+internalFromVCActorT :: VCActorT st msg m ret
+                     -> ActorT (VCState m st) (VCMessage m msg) m ret
+internalFromVCActorT (VCActorT m) = m
+
+internalSend :: (MonadConc m)
+             => VCMailbox m msg
+             -> (MCVC m -> VCMessage m msg)
+             -> VCActorT st msg m ()
+internalSend (VCMailbox addr) msgF = VCActorT $ do
+  (VCState clock state) <- MonadState.get
+  me <- MonadTrans.lift MonadConc.myThreadId
+  let clock' = incrVC me clock
+  MonadState.put (VCState clock' state)
+  MonadActor.send addr (msgF clock')
+
+internalRecv :: (MonadConc m)
+             => (msg -> VCActorT st msg m a)
+             -> (VCMessage m msg -> (MCVC m, VCActorT st msg m (Maybe msg)))
+             -> VCActorT st msg m ()
+internalRecv cb msgF = VCActorT $ MonadActor.recv $ \msg -> do
+  internalIncrClock
+  let (clock, msgAction) = msgF msg
+  internalUpdateClock clock
+  internalFromVCActorT (msgAction >>= maybe (pure ()) (cb .> void))
+
+internalIncrClock :: (MonadConc m)
+                  => ActorT (VCState m st) (VCMessage m msg) m ()
+internalIncrClock = do
+  me <- MonadTrans.lift MonadConc.myThreadId
+  internalModifyClock (incrVC me)
+
+internalUpdateClock :: (MonadConc m)
+                    => VC (MonadConc.ThreadId m)
+                    -> ActorT (VCState m st) (VCMessage m msg) m ()
+internalUpdateClock added = do
+  let compose :: [a -> a] -> (a -> a)
+      compose = map Endo .> mconcat .> appEndo
+  internalModifyClock (compose (updateVC <$> Map.toList (fromVC added)))
+
+internalModifyClock :: (MonadConc m)
+                    => (VC (MonadConc.ThreadId m) -> VC (MonadConc.ThreadId m))
+                    -> ActorT (VCState m st) (VCMessage m msg) m ()
+internalModifyClock f = do
+  (VCState clock state) <- MonadState.get
+  MonadState.put (VCState (f clock) state)
 
 --------------------------------------------------------------------------------
 
-newtype VCMailbox msg m
-  = VCMailbox (ActorT.Mailbox (WithVC m msg) m)
+newtype VCMailbox m msg
+  = VCMailbox (ActorT.Mailbox (VCMessage m msg) m)
 
-deriving instance (MonadConc m) => Eq   (VCMailbox msg m)
-deriving instance (MonadConc m) => Ord  (VCMailbox msg m)
-
-instance (MonadConc m) => Show (VCMailbox msg m) where
-  show (VCMailbox mb) = "VC" ++ show mb
-
---------------------------------------------------------------------------------
-
--- liftVC :: forall st msg m ret.
---           (MonadConc m)
---        => ActorT   st msg m ret
---        -> VCActorT st msg m ret
--- liftVC actor = do
---   clockVar <- do
---     WithVC vc _ <- ActorT.get
---     MonadTrans.lift (MVar.newMVar vc)
---
---   let incrSelf :: m ()
---       incrSelf = do
---         self <- MonadConc.myThreadId
---         MVar.modifyMVar_ clockVar (incrVC self .> pure)
---
---   let modPut :: st -> m (WithVC msg m st)
---       modPut state = do
---         m <- MVar.readMVar clockVar
---         pure (WithVC m state)
---
---   let modGet :: WithVC msg m st -> m st
---       modGet = vcValue .> pure
---
---   let modSend :: msg -> m (WithVC msg m msg)
---       modSend message = do
---         incrSelf
---         m <- MVar.readMVar clockVar
---         pure (WithVC m message)
---
---   let modRecv :: WithVC msg m msg -> m msg
---       modRecv (WithVC m message) = do
---         incrSelf
---         let compose = map Endo .> mconcat .> appEndo
---         let fs = updateVC <$> Map.toList (fromVC m)
---         MVar.modifyMVar_ clockVar (compose fs .> pure)
---         pure message
---
---   ret <- ActorT.mapActorT
---          (Lens.iso modPut modGet)
---          (Lens.iso modSend modRecv)
---          actor
---
---   () <- do
---     WithVC _ state <- ActorT.get
---     vc <- MonadTrans.lift (MVar.readMVar clockVar)
---     ActorT.put (WithVC vc state)
---
---   pure ret
+deriving instance (MonadConc m) => Eq   (VCMailbox m msg)
+deriving instance (MonadConc m) => Ord  (VCMailbox m msg)
+deriving instance (MonadConc m) => Show (VCMailbox m msg)
 
 --------------------------------------------------------------------------------

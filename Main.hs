@@ -21,48 +21,48 @@ import           Control.Arrow
 import           Data.Either
 import           Data.Maybe
 
-import           Flow                       ((.>), (|>))
+import           Flow                             ((.>), (|>))
 
 import           Control.Exception
                  (Exception, NonTermination (NonTermination), throwIO)
 
-import           Control.Monad.Catch        (MonadThrow (throwM))
+import           Control.Monad.Catch              (MonadThrow (throwM))
 
-import           Control.Monad              (forever)
-import           Control.Monad.IO.Class     (MonadIO (liftIO))
+import           Control.Monad                    (forever)
+import           Control.Monad.IO.Class           (MonadIO (liftIO))
 
-import           Control.Concurrent         (threadDelay)
+import           Control.Concurrent               (threadDelay)
 
-import           Control.Concurrent.MVar    (MVar)
-import qualified Control.Concurrent.MVar    as MVar
+import           Control.Concurrent.MVar          (MVar)
+import qualified Control.Concurrent.MVar          as MVar
 
-import           Control.Concurrent.Actor   (ActorM)
-import qualified Control.Concurrent.Actor   as Actor
+import           Control.Concurrent.Actor         (ActorM)
+import qualified Control.Concurrent.Actor         as Actor
 
-import           Control.Monad.Trans.Class  (MonadTrans (lift))
+import           Control.Monad.Trans.Class        (MonadTrans (lift))
 
-import           Control.Monad.Trans.Reader (ReaderT)
-import qualified Control.Monad.Trans.Reader as ReaderT
+import           Control.Monad.Trans.Reader       (ReaderT)
+import qualified Control.Monad.Trans.Reader       as ReaderT
 
-import           Control.Monad.Trans.State  (StateT)
-import qualified Control.Monad.Trans.State  as StateT
+import           Control.Monad.Trans.State.Strict (StateT)
+import qualified Control.Monad.Trans.State.Strict as StateT
 
-import           Data.Text                  (Text)
-import qualified Data.Text                  as Text
+import           Data.Text                        (Text)
+import qualified Data.Text                        as Text
 
-import           Data.Map.Strict            (Map)
-import qualified Data.Map.Strict            as Map
+import           Data.Map.Strict                  (Map)
+import qualified Data.Map.Strict                  as Map
 
-import           Data.Set                   (Set)
-import qualified Data.Set                   as Set
+import           Data.Set                         (Set)
+import qualified Data.Set                         as Set
 
-import           Data.Vector                (Vector, (!?))
-import qualified Data.Vector                as Vector
+import           Data.Vector                      (Vector, (!?))
+import qualified Data.Vector                      as Vector
 
-import           Data.Dynamic               (Dynamic)
-import qualified Data.Dynamic               as Dynamic
+import           Data.Dynamic                     (Dynamic)
+import qualified Data.Dynamic                     as Dynamic
 
-import           Data.Typeable              (Typeable, typeOf)
+import           Data.Typeable                    (Typeable, typeOf)
 
 --------------------------------------------------------------------------------
 

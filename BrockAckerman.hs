@@ -27,7 +27,7 @@ import qualified Control.Concurrent.Classy.MVar as MVar
 import           Control.Monad                  (forever, void)
 
 import qualified Test.DejaFu                    as DejaFu
-import qualified Test.DejaFu.Conc               as DejaFu
+import qualified Test.DejaFu.Conc               as DejaFu.Conc
 
 --------------------------------------------------------------------------------
 
@@ -56,11 +56,11 @@ eager printInt = void $ do
   pure ()
 
 autocheckExhaustive :: (Eq a, Show a)
-                    => (forall s. DejaFu.ConcST s a)
+                    => (forall s. DejaFu.Conc.ConcST s a)
                     -> IO Bool
 autocheckExhaustive action = do
   let way = DejaFu.systematically DejaFu.noBounds
-  let mt = DejaFu.SequentialConsistency
+  let mt = DejaFu.Conc.SequentialConsistency
   DejaFu.autocheckWay way mt action
 
 main :: IO ()
