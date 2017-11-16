@@ -1,6 +1,6 @@
 --------------------------------------------------------------------------------
 
-{-# LANGUAGE ExistentialQuantification  #-}
+{-# LANGUAGE ExistentialQuantification, TypeInType  #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE FunctionalDependencies     #-}
@@ -10,7 +10,9 @@
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE StandaloneDeriving         #-}
+{-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
+{-# LANGUAGE TypeFamilyDependencies     #-}
 
 --------------------------------------------------------------------------------
 
@@ -116,6 +118,10 @@ import qualified Control.Concurrent.Classy.MVar   as MVar
 
 -- Other stuff
 
+import Data.Kind (Type)
+
+import           Data.Proxy                       (Proxy (Proxy))
+
 import qualified Control.Lens                     as Lens
 
 import           Control.Monad                    (forever, (>=>))
@@ -124,30 +130,37 @@ import           Flow                             ((.>), (|>))
 
 --------------------------------------------------------------------------------
 
+type TID m = MonadConc.ThreadId m
+
 -- | FIXME: doc
-class ( Monad m, MonadState st m, MonadConc (C m)
+class ( Monad m, MonadState st m, MonadConc (Underlying m)
+      , Eq (Addr m), Ord (Addr m), Show (Addr m)
       ) => MonadActor st msg m | m -> st, m -> msg where
 
   -- | FIXME: doc
-  type Addr m :: *
+  type family Addr m :: Type
 
   -- | FIXME: doc
-  type C m :: * -> *
+  type family Underlying m :: Type -> Type
 
   -- | FIXME: doc
-  spawn :: st -> m () -> C m (Addr m)
+  addrToTID :: proxy m -> Addr m -> TID (Underlying m)
+
+  -- | FIXME: doc
+  spawn :: st -> m () -> Underlying m (Addr m)
 
   -- | FIXME: doc
   self :: m (Addr m)
-
-  -- | FIXME: doc
-  selfTID :: m (MonadConc.ThreadId m)
 
   -- | FIXME: doc
   send :: Addr m -> msg -> m ()
 
   -- | FIXME: doc
   recv :: (msg -> m a) -> m ()
+
+-- | FIXME: doc
+selfTID :: forall m st msg. (MonadActor st msg m) => m (TID (Underlying m))
+selfTID = addrToTID (Proxy @m) <$> self
 
 --------------------------------------------------------------------------------
 
@@ -189,10 +202,19 @@ instance (MonadConc m) => MonadState st (ActorT st msg m) where
     var <- contextState <$> ActorT ReaderT.ask
     MonadTrans.lift (MVar.putMVar var value)
 
+data Mailbox m msg
+  = Mailbox
+    { mailboxThreadId :: !(MonadConc.ThreadId m)
+    , mailboxSend     :: !(msg -> m ())
+    }
+
 -- | The 'ActorT' monad is, of course, an instance of 'MonadActor'.
 instance (MonadConc m) => MonadActor st msg (ActorT st msg m) where
-  type Addr (ActorT st msg m) = Mailbox msg m
-  type C    (ActorT st msg m) = m
+  type Addr (ActorT st msg m) = Mailbox m msg
+
+  type Underlying (ActorT st msg m) = m
+
+  addrToTID _ = mailboxThreadId
 
   spawn initial (ActorT act) = do
     chan     <- Chan.newChan
@@ -207,8 +229,6 @@ instance (MonadConc m) => MonadActor st msg (ActorT st msg m) where
     chan <- ActorT (ReaderT.asks contextChan)
     tid <- MonadTrans.lift MonadConc.myThreadId
     pure (Mailbox tid (Chan.writeChan chan))
-
-  selfTID = MonadTrans.lift MonadConc.myThreadId
 
   send addr msg = do
     MonadTrans.lift $ mailboxSend addr msg
@@ -230,24 +250,23 @@ data Context st msg m
 
 --------------------------------------------------------------------------------
 
--- | The mailbox of an actor, used to send messages
-data Mailbox msg m
-  = Mailbox
-    { mailboxThreadId :: !(MonadConc.ThreadId m)
-    , mailboxSend     :: !(msg -> m ())
-    }
-
-instance (Eq (MonadConc.ThreadId m)) => Eq (Mailbox msg m) where
+-- instance ( Eq (MonadConc.ThreadId m)
+--          ) => Eq (Addr (ActorT st msg m)) where
+instance (MonadConc m) => Eq (Mailbox m msg) where
   addr1 == addr2 = let tid1 = mailboxThreadId addr1
                        tid2 = mailboxThreadId addr2
                    in tid1 == tid2
 
-instance (Ord (MonadConc.ThreadId m)) => Ord (Mailbox msg m) where
+-- instance ( Ord (MonadConc.ThreadId m)
+--          ) => Ord (Addr (ActorT st msg m)) where
+instance (MonadConc m) => Ord (Mailbox m msg) where
   compare addr1 addr2 = let tid1 = mailboxThreadId addr1
                             tid2 = mailboxThreadId addr2
                         in compare tid1 tid2
 
-instance (Show (MonadConc.ThreadId m)) => Show (Mailbox msg m) where
+-- instance ( Show (MonadConc.ThreadId m)
+--          ) => Show (Addr (ActorT st msg m)) where
+instance (MonadConc m) => Show (Mailbox m msg) where
   show (Mailbox tid _) = "Mailbox(" ++ show tid ++ ")"
 
 --------------------------------------------------------------------------------
