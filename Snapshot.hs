@@ -29,72 +29,75 @@ module Snapshot
 
 --------------------------------------------------------------------------------
 
-import           Actor                          (TID)
+import           Actor                            (TID)
 
-import           Actor                          (ActorT)
-import qualified Actor                          as ActorT
+import           Actor                            (ActorT)
+import qualified Actor                            as ActorT
 
-import           Actor                          (MonadActor)
-import qualified Actor                          as MonadActor
+import           Actor                            (MonadActor)
+import qualified Actor                            as MonadActor
 
-import           VectorClock                    (MonadVC)
-import qualified VectorClock                    as MonadVC
+import           VectorClock                      (MonadVC)
+import qualified VectorClock                      as MonadVC
 
-import           VectorClock                    (VCActorT)
-import qualified VectorClock                    as VCActorT
+import           VectorClock                      (VCActorT)
+import qualified VectorClock                      as VCActorT
 
-import           Control.Monad.Trans.Class      (MonadTrans)
-import qualified Control.Monad.Trans.Class      as MonadTrans
+import           Control.Monad.Trans.Class        (MonadTrans)
+import qualified Control.Monad.Trans.Class        as MonadTrans
 
-import           Control.Monad.State.Class      (MonadState)
-import qualified Control.Monad.State.Class      as MonadState
+import           Control.Monad.State.Class        (MonadState)
+import qualified Control.Monad.State.Class        as MonadState
 
-import           Control.Monad.Conc.Class       (MonadConc)
-import qualified Control.Monad.Conc.Class       as MonadConc
+import           Control.Monad.Conc.Class         (MonadConc)
+import qualified Control.Monad.Conc.Class         as MonadConc
 
-import           Control.Monad.Catch            (MonadThrow)
-import qualified Control.Monad.Catch            as MonadThrow
+import           Control.Monad.Catch              (MonadThrow)
+import qualified Control.Monad.Catch              as MonadThrow
 
-import           Control.Monad.Catch            (MonadCatch)
-import qualified Control.Monad.Catch            as MonadCatch
+import           Control.Monad.Catch              (MonadCatch)
+import qualified Control.Monad.Catch              as MonadCatch
 
-import           Control.Monad.Catch            (MonadMask)
-import qualified Control.Monad.Catch            as MonadMask
+import           Control.Monad.Catch              (MonadMask)
+import qualified Control.Monad.Catch              as MonadMask
 
-import           Control.Concurrent.Classy.MVar (MVar)
-import qualified Control.Concurrent.Classy.MVar as MVar
+import           Control.Monad.Trans.State.Strict (StateT)
+import qualified Control.Monad.Trans.State.Strict as StateT
+
+import           Control.Concurrent.Classy.MVar   (MVar)
+import qualified Control.Concurrent.Classy.MVar   as MVar
 
 import           Control.Monad
-import           Control.Monad.Extra            (whileM)
+import           Control.Monad.Extra              (whileM)
 
-import           Data.Map.Strict                (Map)
-import qualified Data.Map.Strict                as Map
+import           Data.Map.Strict                  (Map)
+import qualified Data.Map.Strict                  as Map
 
-import           Data.Set                       (Set)
-import qualified Data.Set                       as Set
+import           Data.Set                         (Set)
+import qualified Data.Set                         as Set
 
-import qualified Control.Lens                   as Lens
+import qualified Control.Lens                     as Lens
 
 import           Data.Maybe
 import           Data.Monoid
 
-import           Data.Dynamic                   (Dynamic)
-import qualified Data.Dynamic                   as Dynamic
+import           Data.Dynamic                     (Dynamic)
+import qualified Data.Dynamic                     as Dynamic
 
-import           Data.Vector                    (Vector)
-import qualified Data.Vector                    as Vector
+import           Data.Vector                      (Vector)
+import qualified Data.Vector                      as Vector
 
-import           Data.Proxy                     (Proxy (Proxy))
+import           Data.Proxy                       (Proxy (Proxy))
 
-import           Data.Void                      (Void, absurd)
+import           Data.Void                        (Void, absurd)
 
-import           Data.Typeable                  (Typeable)
+import           Data.Typeable                    (Typeable)
 
-import           Data.Kind                      (Type)
+import           Data.Kind                        (Type)
 
-import           Data.Functor.Identity          (runIdentity)
+import           Data.Functor.Identity            (runIdentity)
 
-import           Flow                           ((.>), (|>))
+import           Flow                             ((.>), (|>))
 
 --------------------------------------------------------------------------------
 
@@ -277,8 +280,83 @@ gssPut :: (MonadConc u, Typeable st, Typeable u)
        -> SActorT st msg u Bool
 gssPut (GenSState state) = do
   case Dynamic.fromDynamic (Dynamic.toDyn state) of
-    Just state -> SActorT (MonadState.put state) >> pure True
-    Nothing    -> pure False
+    Just s  -> SActorT (MonadState.put s) >> pure True
+    Nothing -> pure False
+
+--------------------------------------------------------------------------------
+
+type Spawned u = Map (MonadActor.TID u) (GenSMailbox u)
+
+newtype WithSpawned u a
+  = WithSpawned { fromWithSpawned :: StateT (Spawned u) u a }
+
+runWithSpawned :: (MonadConc u) => WithSpawned u a -> u a
+runWithSpawned (WithSpawned m) = StateT.evalStateT m mempty
+
+liftWS :: (Monad u) => u a -> WithSpawned u a
+liftWS = MonadTrans.lift .> WithSpawned
+
+deriving instance (Functor     u) => Functor     (WithSpawned u)
+deriving instance (Monad       u) => Applicative (WithSpawned u)
+deriving instance (Monad       u) => Monad       (WithSpawned u)
+deriving instance (MonadThrow  u) => MonadThrow  (WithSpawned u)
+deriving instance (MonadCatch  u) => MonadCatch  (WithSpawned u)
+deriving instance (MonadMask   u) => MonadMask   (WithSpawned u)
+
+instance (MonadConc u) => MonadConc (WithSpawned u) where
+  type STM      (WithSpawned u) = MonadConc.STM u
+  type MVar     (WithSpawned u) = MonadConc.MVar u
+  type CRef     (WithSpawned u) = MonadConc.CRef u
+  type Ticket   (WithSpawned u) = MonadConc.Ticket u
+  type ThreadId (WithSpawned u) = MonadConc.ThreadId u
+
+  fork (WithSpawned m) = WithSpawned (MonadConc.fork m)
+  forkOn i (WithSpawned m) = WithSpawned (MonadConc.forkOn i m)
+
+  forkWithUnmask        f = WithSpawned
+                            $ MonadConc.forkWithUnmask
+                            $ \g -> (fromWithSpawned
+                                     (f (fromWithSpawned .> g .> WithSpawned)))
+  forkWithUnmaskN   n   f = WithSpawned
+                            $ MonadConc.forkWithUnmaskN n
+                            $ \g -> (fromWithSpawned
+                                     (f (fromWithSpawned .> g .> WithSpawned)))
+  forkOnWithUnmask    i f = WithSpawned
+                            $ MonadConc.forkOnWithUnmask i
+                            $ \g -> (fromWithSpawned
+                                     (f (fromWithSpawned .> g .> WithSpawned)))
+  forkOnWithUnmaskN n i f = WithSpawned
+                            $ MonadConc.forkOnWithUnmaskN n i
+                            $ \g -> (fromWithSpawned
+                                     (f (fromWithSpawned .> g .> WithSpawned)))
+
+  getNumCapabilities = liftWS MonadConc.getNumCapabilities
+  setNumCapabilities = liftWS . MonadConc.setNumCapabilities
+  myThreadId         = liftWS MonadConc.myThreadId
+  yield              = liftWS MonadConc.yield
+  threadDelay        = liftWS . MonadConc.threadDelay
+  throwTo t          = liftWS . MonadConc.throwTo t
+  newEmptyMVar       = liftWS MonadConc.newEmptyMVar
+  newEmptyMVarN      = liftWS . MonadConc.newEmptyMVarN
+  readMVar           = liftWS . MonadConc.readMVar
+  tryReadMVar        = liftWS . MonadConc.tryReadMVar
+  putMVar v          = liftWS . MonadConc.putMVar v
+  tryPutMVar v       = liftWS . MonadConc.tryPutMVar v
+  takeMVar           = liftWS . MonadConc.takeMVar
+  tryTakeMVar        = liftWS . MonadConc.tryTakeMVar
+  newCRef            = liftWS . MonadConc.newCRef
+  newCRefN n         = liftWS . MonadConc.newCRefN n
+  readCRef           = liftWS . MonadConc.readCRef
+  atomicModifyCRef r = liftWS . MonadConc.atomicModifyCRef r
+  writeCRef r        = liftWS . MonadConc.writeCRef r
+  atomicWriteCRef r  = liftWS . MonadConc.atomicWriteCRef r
+  readForCAS         = liftWS . MonadConc.readForCAS
+  peekTicket' _      = MonadConc.peekTicket' (Proxy :: Proxy u)
+  casCRef r t        = liftWS . MonadConc.casCRef r t
+  modifyCRefCAS r    = liftWS . MonadConc.modifyCRefCAS r
+  modifyCRefCAS_ r   = liftWS . MonadConc.modifyCRefCAS_ r
+  atomically         = liftWS . MonadConc.atomically
+  readTVarConc       = liftWS . MonadConc.readTVarConc
 
 --------------------------------------------------------------------------------
 
@@ -307,18 +385,21 @@ instance ( MonadConc u, Typeable st, Typeable msg
   type A (SActorT st msg u) = SMailbox u
   type S (SActorT st msg u) = st
   type M (SActorT st msg u) = msg
-  type U (SActorT st msg u) = u
+  type U (SActorT st msg u) = WithSpawned u
 
   addrToTID _ = (\(SMailbox mb) -> mb)
                 .> (MonadActor.addrToTID
                     (Proxy @(VCActorT (SState u st) (SMessage u msg) u)))
 
-  spawn initial (SActorT act)
-    = SMailbox <$> MonadActor.spawn (initialSState initial) act
+  spawn initial (SActorT act) = do
+    mb <- liftWS (SMailbox <$> MonadActor.spawn (initialSState initial) act)
+    WithSpawned (MonadState.modify (Map.insert _ _))
+    pure mb
 
   self = SMailbox <$> SActorT MonadActor.self
 
   send (SMailbox addr) value = do
+    -- FIXME: we need to send SMessageDone here
     tokens <- SActorT (Lens.use tokensInSState)
     me <- GenSMailbox <$> MonadActor.self
     SActorT (MonadActor.send addr (SMessageNormal tokens me value))
@@ -474,18 +555,7 @@ snapshotSetState :: forall u st msg.
 snapshotSetState sid tid state
   = upsertActorSnapshot sid tid (ActorSnapshot state mempty)
 
--- ~ -- | FIXME: doc
--- ~ snapshotAddMessage :: forall u st msg.
--- ~                       (MonadConc u, Typeable st, Typeable msg)
--- ~                    => SnapshotID u
--- ~                    -> (MonadActor.TID u, MonadActor.TID u)
--- ~                    -> GenSMessage u
--- ~                    -> SActorT st msg u ()
--- ~ snapshotAddMessage sid (fromTID, toTID) msg = do
--- ~   let f :: ActorSnapshot u -> ActorSnapshot u
--- ~       f = Lens.over messagesInActorSnapshot
--- ~           (\v -> Vector.snoc v (fromTID, msg))
--- ~   upsertSnapshot sid (Lens.over statesInSystemSnapshot (Map.adjust f toTID))
+--------------------------------------------------------------------------------
 
 snapshot :: forall st msg u.
             (MonadConc u, Typeable st, Typeable msg)
@@ -498,7 +568,7 @@ snapshot actors = do
     start <- MonadVC.lookupVC origin <$> MonadVC.getClock
     pure (SnapshotID origin start)
 
-  -- Save the current state of the observer
+  -- Save the current state of the observer to the snapshot.
   () <- do
     me <- MonadActor.selfTID
     saved <- GenSState <$> SActorT MonadState.get
@@ -506,22 +576,28 @@ snapshot actors = do
 
   -- For each actor `a`:
   Vector.forM_ actors $ \actor -> do
-    -- Foobar
+    -- Initialize `a` as "not done".
+    upsertSnapshot snapID
+      $ Lens.over doneInSystemSnapshot
+      $ Map.insert (gsmTID actor) False
 
     -- Send a "start snapshot" message to `a`.
     me <- GenSMailbox <$> MonadActor.self
     gsmSend actor (SMessageStart snapID me)
 
-
-  -- FIXME: doc
+  -- Receive messages until the snapshot is finished.
+  --
+  -- The actor saves the messages in a 'Vector' and then adds them back into the
+  -- message queue at the end by sending them to itself.
   () <- do
-    let recurse :: Vector (STokens u, GenSMailbox u, msg) -> SActorT st msg u ()
+    let recurse :: Vector (STokens u, GenSMailbox u, msg)
+                -> SActorT st msg u ()
         recurse missed = do
-          -- If the "done" map associated with our snapshot is all 'True',
-          -- then the snapshot is finished.
           internalRecv $ \(tokens, origin, msg) -> SActorT $ do
             me <- MonadActor.self
             let missed' = Vector.snoc missed (tokens, origin, msg)
+            -- If the "done" map associated with our snapshot is all 'True',
+            -- then the snapshot is finished.
             finished <- Lens.use (snapshotsInSState . Lens.at snapID)
                         >>= fmap (Lens.view doneInSystemSnapshot)
                         .>  maybe False (Map.elems .> and)
@@ -537,7 +613,21 @@ snapshot actors = do
   -- The snapshot is now guaranteed to be finished, so we look it up in the
   -- hashtable of snapshots. The assertion should never fail, but we cannot
   -- guarantee this statically without much more complicated types.
-  SActorT (Lens.use (snapshotsInSState . Lens.at snapID))
-    >>= maybe (fail "assertion failed!") pure
+  result <- SActorT (Lens.use (snapshotsInSState . Lens.at snapID))
+            >>= maybe (fail "assertion failed!") pure
+
+  -- Now that the snapshot is finished and we've retrieved it from the state,
+  -- we can delete it from the state.
+  SActorT (Lens.modifying snapshotsInSState (Map.delete snapID))
+
+  pure result
+
+--------------------------------------------------------------------------------
+
+restore :: forall st msg u.
+           (MonadConc u, Typeable st, Typeable msg)
+        => SystemSnapshot u
+        -> SActorT st msg u ()
+restore = _
 
 --------------------------------------------------------------------------------
