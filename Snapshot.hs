@@ -1,6 +1,7 @@
 --------------------------------------------------------------------------------
 
 {-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE ExistentialQuantification  #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
@@ -8,10 +9,13 @@
 {-# LANGUAGE GADTs                      #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures             #-}
+{-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE StandaloneDeriving         #-}
+{-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE TypeInType                 #-}
@@ -60,7 +64,7 @@ import qualified Control.Monad.Catch            as MonadMask
 import           Control.Concurrent.Classy.MVar (MVar)
 import qualified Control.Concurrent.Classy.MVar as MVar
 
-import           Control.Monad                  (forever)
+import           Control.Monad
 import           Control.Monad.Extra            (whileM)
 
 import           Data.Map.Strict                (Map)
@@ -82,6 +86,8 @@ import qualified Data.Vector                    as Vector
 
 import           Data.Proxy                     (Proxy (Proxy))
 
+import           Data.Void                      (Void, absurd)
+
 import           Data.Typeable                  (Typeable)
 
 import           Data.Kind                      (Type)
@@ -94,185 +100,444 @@ import           Flow                           ((.>), (|>))
 
 newtype SMailbox u msg
   = SMailbox (VCActorT.VCMailbox u (SMessage u msg))
-
-deriving instance (MonadConc u) => Eq   (SMailbox u msg)
-deriving instance (MonadConc u) => Ord  (SMailbox u msg)
-deriving instance (MonadConc u) => Show (SMailbox u msg)
+  deriving ()
 
 --------------------------------------------------------------------------------
 
 data GenSMailbox u where
   GenSMailbox :: (Typeable msg) => SMailbox u msg -> GenSMailbox u
 
+useGenSMailbox :: (forall msg. (Typeable msg) => SMailbox u msg -> a)
+               -> GenSMailbox u -> a
+useGenSMailbox f (GenSMailbox mb) = f mb
+
+--------------------------------------------------------------------------------
+
+type GenSMessage u = (STokens u, Dynamic)
+
 --------------------------------------------------------------------------------
 
 data ActorSnapshot u
   = ActorSnapshot
     { _ActorSnapshot_state    :: !(GenSState u)
-    , _ActorSnapshot_messages :: !(Vector (MonadConc.ThreadId u, Dynamic))
+    , _ActorSnapshot_messages :: !(Vector (MonadActor.TID u, GenSMessage u))
     }
+
+stateInActorSnapshot :: Lens.Lens' (ActorSnapshot u) (GenSState u)
+stateInActorSnapshot = Lens.lens _ActorSnapshot_state
+                       $ \(ActorSnapshot {..}) x ->
+                           ActorSnapshot { _ActorSnapshot_state = x, .. }
+
+messagesInActorSnapshot :: Lens.Lens'
+                           (ActorSnapshot u)
+                           (Vector (MonadActor.TID u, GenSMessage u))
+messagesInActorSnapshot = Lens.lens _ActorSnapshot_messages
+                          $ \(ActorSnapshot {..}) x ->
+                              ActorSnapshot { _ActorSnapshot_messages = x, .. }
 
 --------------------------------------------------------------------------------
 
 data SystemSnapshot u
   = SystemSnapshot
-    { _SystemSnapshot_states :: !(Map (MonadConc.ThreadId u) (ActorSnapshot u))
-    , _SystemSnapshot_done   :: !(Map (MonadConc.ThreadId u) Bool)
+    { _SystemSnapshot_states :: !(Map (MonadActor.TID u) (ActorSnapshot u))
+    , _SystemSnapshot_done   :: !(Map (MonadActor.TID u) Bool)
     }
 
 emptySystemSnapshot :: SystemSnapshot u
 emptySystemSnapshot = SystemSnapshot Map.empty Map.empty
 
+statesInSystemSnapshot :: Lens.Lens'
+                          (SystemSnapshot u)
+                          (Map (MonadActor.TID u) (ActorSnapshot u))
+statesInSystemSnapshot = Lens.lens _SystemSnapshot_states
+                         $ \(SystemSnapshot {..}) x ->
+                             SystemSnapshot { _SystemSnapshot_states = x, .. }
+
+doneInSystemSnapshot :: Lens.Lens'
+                        (SystemSnapshot u)
+                        (Map (MonadActor.TID u) Bool)
+doneInSystemSnapshot = Lens.lens _SystemSnapshot_done
+                       $ \(SystemSnapshot {..}) x ->
+                           SystemSnapshot { _SystemSnapshot_done = x, .. }
+
 --------------------------------------------------------------------------------
 
 data SnapshotID u
   = SnapshotID
-    { _SnapshotID_origin :: !(MonadConc.ThreadId u)
+    { _SnapshotID_origin :: !(MonadActor.TID u)
     , _SnapshotID_start  :: !MonadVC.Clock
     }
 
 deriving instance (MonadConc u) => Eq  (SnapshotID u)
 deriving instance (MonadConc u) => Ord (SnapshotID u)
 
+originInSnapshotID :: Lens.Lens' (SnapshotID u) (MonadActor.TID u)
+originInSnapshotID
+  = Lens.lens _SnapshotID_origin
+    $ \(SnapshotID {..}) x -> SnapshotID { _SnapshotID_origin = x, .. }
+
+startInSnapshotID :: Lens.Lens' (SnapshotID u) MonadVC.Clock
+startInSnapshotID
+  = Lens.lens _SnapshotID_start
+    $ \(SnapshotID {..}) x -> SnapshotID { _SnapshotID_start = x, .. }
+
 --------------------------------------------------------------------------------
 
-data SToken u msg
-  = SToken
-    { _SToken_send :: !(SMessage u msg -> u ())
-    , _SToken_id   :: !(SnapshotID u)
+data STokens u
+  = STokens
+    { _STokens_map :: !(Map (SnapshotID u) (GenSMailbox u))
     }
+
+_STokens :: Lens.Iso' (STokens u) (Map (SnapshotID u) (GenSMailbox u))
+_STokens = Lens.iso _STokens_map STokens
 
 --------------------------------------------------------------------------------
 
 data SMessage u msg
   = SMessageNormal
-    { _SMessageNormal_tokens  :: !(Set (SToken u msg))
-    , _SMessageNormal_from    :: !(GenSMailbox u)
+    { _SMessageNormal_tokens  :: !(STokens u)
+    , _SMessageNormal_origin  :: !(GenSMailbox u)
     , _SMessageNormal_message :: !msg
     }
-  | SMessageReceived
-    { _SMessageReceived_sender   :: !(GenSMailbox u)
-    , _SMessageReceived_recip    :: !(GenSMailbox u)
-    , _SMessageReceived_contents :: !(Set (SnapshotID u), Dynamic)
+  | SMessageRecv
+    { _SMessageRecv_sid       :: !(SnapshotID u)
+    , _SMessageRecv_sendActor :: !(GenSMailbox u)
+    , _SMessageRecv_recvActor :: !(GenSMailbox u)
+    , _SMessageRecv_contents  :: !(GenSMessage u)
     }
   | SMessageState
-    { _SMessageState_from  :: !(GenSMailbox u)
+    { _SMessageState_sid   :: !(SnapshotID u)
+    , _SMessageState_actor :: !(GenSMailbox u)
     , _SMessageState_state :: !(GenSState u)
     }
-  | SMessageDone
-    { _SMessageDone_id :: !(SnapshotID u)
+  | SMessageStart
+    { _SMessageStart_sid      :: !(SnapshotID u)
+    , _SMessageStart_observer :: !(GenSMailbox u)
     }
+  | SMessageDone
+    { _SMessageDone_sid   :: !(SnapshotID u)
+    , _SMessageDone_actor :: !(GenSMailbox u)
+    }
+  deriving (Functor)
+
+--------------------------------------------------------------------------------
+
+gsmSend :: (MonadConc u)
+        => GenSMailbox u
+        -> SMessage u Void
+        -> SActorT st msg u ()
+gsmSend (GenSMailbox (SMailbox mb)) = \case
+  (SMessageRecv   {..}) -> SActorT (MonadActor.send mb (SMessageRecv  {..}))
+  (SMessageState  {..}) -> SActorT (MonadActor.send mb (SMessageState {..}))
+  (SMessageStart  {..}) -> SActorT (MonadActor.send mb (SMessageStart {..}))
+  (SMessageDone   {..}) -> SActorT (MonadActor.send mb (SMessageDone  {..}))
+  (SMessageNormal {..}) -> absurd _SMessageNormal_message
+
+gsmTID :: forall u. (MonadConc u) => GenSMailbox u -> MonadActor.TID u
+gsmTID (GenSMailbox (SMailbox mb))
+  = MonadActor.addrToTID
+    (Proxy @(VCActorT (SState u _) (SMessage u _) u)) mb
 
 --------------------------------------------------------------------------------
 
 data SState u st
   = SState
     { _SState_snapshots :: !(Map (SnapshotID u) (SystemSnapshot u))
+    , _SState_tokens    :: !(STokens u)
     , _SState_state     :: !st
     }
+
+initialSState :: (MonadConc u) => st -> SState u st
+initialSState initial = SState mempty (STokens mempty) initial
+
+snapshotsInSState :: Lens.Lens'
+                     (SState u st)
+                     (Map (SnapshotID u) (SystemSnapshot u))
+snapshotsInSState = Lens.lens _SState_snapshots
+                    $ \(SState {..}) x -> SState { _SState_snapshots = x, .. }
+
+tokensInSState :: Lens.Lens' (SState u st) (STokens u)
+tokensInSState = Lens.lens _SState_tokens
+                 $ \(SState {..}) x -> SState { _SState_tokens = x, .. }
+
+stateInSState :: Lens.Lens' (SState u st) st
+stateInSState = Lens.lens _SState_state
+                $ \(SState {..}) x -> SState { _SState_state = x, .. }
 
 --------------------------------------------------------------------------------
 
 data GenSState u where
   GenSState :: (Typeable st) => SState u st -> GenSState u
 
+gssGet :: (MonadConc u, Typeable st) => SActorT st msg u (GenSState u)
+gssGet = GenSState <$> SActorT MonadState.get
+
+gssPut :: (MonadConc u, Typeable st, Typeable u)
+       => GenSState u
+       -> SActorT st msg u Bool
+gssPut (GenSState state) = do
+  case Dynamic.fromDynamic (Dynamic.toDyn state) of
+    Just state -> SActorT (MonadState.put state) >> pure True
+    Nothing    -> pure False
+
 --------------------------------------------------------------------------------
 
-newtype SActorT st msg m ret
-  = SActorT (VCActorT (SState m st) (SMessage m msg) m ret)
+newtype SActorT st msg u ret
+  = SActorT
+    { runSActorT :: VCActorT (SState u st) (SMessage u msg) u ret }
 
-deriving instance (Functor     m) => Functor     (SActorT st msg m)
-deriving instance (Applicative m) => Applicative (SActorT st msg m)
-deriving instance (Monad       m) => Monad       (SActorT st msg m)
-deriving instance (MonadThrow  m) => MonadThrow  (SActorT st msg m)
-deriving instance (MonadCatch  m) => MonadCatch  (SActorT st msg m)
-deriving instance (MonadMask   m) => MonadMask   (SActorT st msg m)
+deriving instance (Functor     u) => Functor     (SActorT st msg u)
+deriving instance (Applicative u) => Applicative (SActorT st msg u)
+deriving instance (Monad       u) => Monad       (SActorT st msg u)
+deriving instance (MonadThrow  u) => MonadThrow  (SActorT st msg u)
+deriving instance (MonadCatch  u) => MonadCatch  (SActorT st msg u)
+deriving instance (MonadMask   u) => MonadMask   (SActorT st msg u)
 
 instance MonadTrans (SActorT st msg) where
   lift = MonadTrans.lift .> SActorT
 
-instance (MonadConc m, Typeable st) => MonadVC st msg (SActorT st msg m) where
-  getClock = SActorT MonadVC.getClock
-
-instance (MonadConc m) => MonadState st (SActorT st msg m) where
+instance (MonadConc u) => MonadState st (SActorT st msg u) where
   get = _SState_state <$> SActorT MonadState.get
   put value = SActorT $ do
-    SState snapshots state <- MonadState.get
-    MonadState.put (SState snapshots value)
+    SState snapshots tokens _ <- MonadState.get
+    MonadState.put (SState snapshots tokens value)
 
-instance ( MonadConc u, Typeable st
-         ) => MonadActor st msg (SActorT st msg u) where
-  type Addr       (SActorT st msg u) = SMailbox u msg
-  type Underlying (SActorT st msg u) = u
+instance ( MonadConc u, Typeable st, Typeable msg
+         ) => MonadActor (SActorT st msg u) where
+  type A (SActorT st msg u) = SMailbox u
+  type S (SActorT st msg u) = st
+  type M (SActorT st msg u) = msg
+  type U (SActorT st msg u) = u
 
-  addrToTID proxy = (\(SMailbox mb) -> mb)
-                    .> MonadActor.addrToTID (Proxy @(VCActorT _ _ _))
+  addrToTID _ = (\(SMailbox mb) -> mb)
+                .> (MonadActor.addrToTID
+                    (Proxy @(VCActorT (SState u st) (SMessage u msg) u)))
 
-  spawn initial (SActorT act) = _
+  spawn initial (SActorT act)
+    = SMailbox <$> MonadActor.spawn (initialSState initial) act
 
   self = SMailbox <$> SActorT MonadActor.self
 
-  send = _
+  send (SMailbox addr) value = do
+    tokens <- SActorT (Lens.use tokensInSState)
+    me <- GenSMailbox <$> MonadActor.self
+    SActorT (MonadActor.send addr (SMessageNormal tokens me value))
 
-  recv = _
+  recv cb = internalRecv (\(_, _, msg) -> void $ cb msg)
+
+instance ( MonadConc u, Typeable st, Typeable msg
+         ) => MonadVC (SActorT st msg u) where
+  getClock = SActorT MonadVC.getClock
+
+--------------------------------------------------------------------------------
+
+internalRecv :: forall st msg u.
+                (MonadConc u, Typeable st, Typeable msg)
+             => ((STokens u, GenSMailbox u, msg) -> SActorT st msg u ())
+             -> SActorT st msg u ()
+internalRecv cb = do
+  -- Handle an incoming 'SMessageNormal' message.
+  let handleNormal :: (STokens u, GenSMailbox u, msg)
+                   -> SActorT st msg u ()
+      handleNormal (tokens, origin, value) = void $ do
+        myTokenMap <- SActorT (Lens.use (tokensInSState . _STokens))
+
+        let messageTokenMap :: Map (SnapshotID u) (GenSMailbox u)
+            messageTokenMap = Lens.view _STokens tokens
+
+        let diff :: (Ord k) => Map k a -> Map k a -> [(k, a)]
+            diff a b = Map.toList (Map.difference a b)
+
+        -- Iterate over the tokens that we are seeing for the first time in
+        -- this message.
+        forM_ (diff messageTokenMap myTokenMap) $ \(sid, observerGMB) -> do
+          -- Send our state to the observer process of the token.
+          void $ do
+            me <- GenSMailbox <$> MonadActor.self
+            gss <- gssGet
+            gsmSend observerGMB (SMessageState sid me gss)
+
+          -- Add the token to our tokens map.
+          void $ do
+            let combine :: GenSMailbox u -> GenSMailbox u -> GenSMailbox u
+                combine _ _ = error "something very weird is happening"
+            SActorT $ Lens.modifying (tokensInSState . _STokens)
+              $ Map.insertWith combine sid observerGMB
+
+        -- Iterate over the tokens that we have seen that are not in the
+        -- received message.
+        forM_ (diff myTokenMap messageTokenMap) $ \(sid, observerGMB) -> do
+          -- Forward the message to the observer process, since it must have
+          -- been sent before the snapshot.
+          void $ do
+            sender <- pure origin
+            recip  <- GenSMailbox <$> MonadActor.self
+            let contents :: (STokens u, Dynamic)
+                contents = (tokens, Dynamic.toDyn value)
+            gsmSend observerGMB (SMessageRecv sid sender recip contents)
+
+        -- Yield control to the callback we were given.
+        cb (tokens, origin, value)
+
+  -- Handle an incoming 'SMessageRecv' message.
+  let handleRecv :: (SnapshotID u, GenSMailbox u, GenSMailbox u, GenSMessage u)
+                 -> SActorT st msg u ()
+      handleRecv (sid, sender, recip, contents) = void $ do
+        -- ~ snapshotAddMessage sid (gsmTID sender, gsmTID recip) contents
+        let f :: ActorSnapshot u -> ActorSnapshot u
+            f = Lens.over messagesInActorSnapshot
+                (\v -> Vector.snoc v (gsmTID sender, contents))
+        upsertSnapshot sid
+          $ Lens.over statesInSystemSnapshot (Map.adjust f (gsmTID recip))
+
+  -- Handle an incoming 'SMessageState' message.
+  let handleState :: (SnapshotID u, GenSMailbox u, GenSState u)
+                  -> SActorT st msg u ()
+      handleState (sid, actor, state) = void $ do
+        -- Set the state of the actor associated with the given 'GenSMailbox'
+        -- to the given 'GenSState' in the 'SystemSnapshot' associated with
+        -- the given 'SnapshotID'.
+        snapshotSetState sid (gsmTID actor) state
+
+  -- Handle an incoming 'SMessageStart' message.
+  let handleStart :: (SnapshotID u, GenSMailbox u)
+                  -> SActorT st msg u ()
+      handleStart (sid, observer) = void $ do
+        SActorT (Lens.modifying
+                 (tokensInSState . _STokens) (Map.insert sid observer))
+
+  -- Handle an incoming 'SMessageDone' message.
+  let handleDone :: (SnapshotID u, GenSMailbox u)
+                 -> SActorT st msg u ()
+      handleDone (sid, actor) = void $ do
+        -- Set the actor associated with the given 'GenSMailbox' to "done"
+        -- in the 'SystemSnapshot' associated with the given 'SnapshotID'.
+        upsertSnapshot sid
+          $ Lens.over doneInSystemSnapshot
+          $ Map.insert (gsmTID actor) True
+
+  -- Dispatch on the received message.
+  SActorT $ MonadActor.recv $ \msg -> do
+    runSActorT $ case msg of
+      SMessageNormal ts  f   value -> handleNormal (ts, f, value)
+      SMessageRecv   sid s r value -> handleRecv   (sid, s, r, value)
+      SMessageState  sid a   state -> handleState  (sid, a, state)
+      SMessageStart  sid o         -> handleStart  (sid, o)
+      SMessageDone   sid a         -> handleDone   (sid, a)
+
+--------------------------------------------------------------------------------
 
 addMapDefault :: (Ord k) => (k, v) -> Map k v -> Map k v
 addMapDefault (k, v) = Map.alter (fromMaybe v .> Just) k
 
+-- | Update the snapshot with the given 'SnapshotID' using the given function.
+--   If there is no snapshot with that 'SnapshotID', we first create a default
+--   using an empty 'SystemSnapshot'.
 upsertSnapshot :: forall u st msg.
                   (MonadConc u, Typeable st, Typeable msg)
                => SnapshotID u
                -> (SystemSnapshot u -> SystemSnapshot u)
                -> SActorT st msg u ()
-upsertSnapshot sid f = SActorT $ MonadState.modify $ \old -> runIdentity $ do
-  let (SState snapshots state) = old
-  let snapshots' = snapshots
-                   |> addMapDefault (sid, emptySystemSnapshot)
-                   |> Map.adjust f sid
-  pure (SState snapshots' state)
+upsertSnapshot sid f = SActorT $ do
+  Lens.modifying snapshotsInSState
+    (addMapDefault (sid, emptySystemSnapshot) .> Map.adjust f sid)
 
+-- | Update the 'ActorSnapshot' associated with the actor with the given
+--   'MonadActor.TID' in the snapshot with the given 'SnapshotID'.
+--
+--   If there is already an 'ActorSnapshot' with that 'MonadActor.TID' and
+--   'SnapshotID', the new 'ActorSnapshot' will be combined with the old in
+--   the following way:
+--     1. The new actor state replaces the old state.
+--     2. The new message vector is appended to the old message vector.
+upsertActorSnapshot :: forall u st msg.
+                       (MonadConc u, Typeable st, Typeable msg)
+                    => SnapshotID u
+                    -> MonadActor.TID u
+                    -> ActorSnapshot u
+                    -> SActorT st msg u ()
+upsertActorSnapshot sid tid snap = do
+  let combine :: ActorSnapshot u -> ActorSnapshot u -> ActorSnapshot u
+      combine (ActorSnapshot sOld mOld) (ActorSnapshot sNew mNew)
+        = ActorSnapshot sNew (mOld <> mNew)
+  upsertSnapshot sid
+    $ Lens.over statesInSystemSnapshot (Map.insertWith (flip combine) tid snap)
+
+-- | Set the state associated with the actor with the given 'MonadActor.TID'
+--   in the snapshot with the given 'SnapshotID'.
 snapshotSetState :: forall u st msg.
                     (MonadConc u, Typeable st, Typeable msg)
                  => SnapshotID u
-                 -> MonadConc.ThreadId u
+                 -> MonadActor.TID u
                  -> GenSState u
                  -> SActorT st msg u ()
-snapshotSetState sid tid state = do
-  upsertSnapshot sid $ \(SystemSnapshot states done) -> runIdentity $ do
-    let combine :: ActorSnapshot u -> ActorSnapshot u -> ActorSnapshot u
-        combine (ActorSnapshot sA mA) (ActorSnapshot sB mB)
-          = ActorSnapshot sA (mB <> mA)
-    let asnap   = ActorSnapshot state Vector.empty
-    let states' = Map.insertWith combine tid asnap states
-    pure (SystemSnapshot states' done)
+snapshotSetState sid tid state
+  = upsertActorSnapshot sid tid (ActorSnapshot state mempty)
 
-snapshotAddMessage :: forall u st msg.
-                      (MonadConc u, Typeable st, Typeable msg)
-                   => SnapshotID u
-                   -> (MonadConc.ThreadId u, MonadConc.ThreadId u)
-                   -> msg
-                   -> SActorT st msg u ()
-snapshotAddMessage sid (fromTID, toTID) msg = do
-  upsertSnapshot sid $ \(SystemSnapshot states done) -> runIdentity $ do
-    let f :: ActorSnapshot u -> ActorSnapshot u
-        f (ActorSnapshot s ms)
-          = ActorSnapshot s (Vector.snoc ms (fromTID, Dynamic.toDyn msg))
-    let states' = Map.adjust f toTID states
-    pure (SystemSnapshot states' done)
+-- ~ -- | FIXME: doc
+-- ~ snapshotAddMessage :: forall u st msg.
+-- ~                       (MonadConc u, Typeable st, Typeable msg)
+-- ~                    => SnapshotID u
+-- ~                    -> (MonadActor.TID u, MonadActor.TID u)
+-- ~                    -> GenSMessage u
+-- ~                    -> SActorT st msg u ()
+-- ~ snapshotAddMessage sid (fromTID, toTID) msg = do
+-- ~   let f :: ActorSnapshot u -> ActorSnapshot u
+-- ~       f = Lens.over messagesInActorSnapshot
+-- ~           (\v -> Vector.snoc v (fromTID, msg))
+-- ~   upsertSnapshot sid (Lens.over statesInSystemSnapshot (Map.adjust f toTID))
 
-snapshot :: forall u st msg.
+snapshot :: forall st msg u.
             (MonadConc u, Typeable st, Typeable msg)
-         => SActorT st msg u (SystemSnapshot u)
-snapshot = do
-  snapshotID :: SnapshotID u <- do
+         => Vector (GenSMailbox u)
+         -> SActorT st msg u (SystemSnapshot u)
+snapshot actors = do
+  -- Create the snapshot ID
+  snapID :: SnapshotID u <- do
     origin <- MonadActor.selfTID
-    start <- VCActorT.lookupVC origin <$> MonadVC.getClock
+    start <- MonadVC.lookupVC origin <$> MonadVC.getClock
     pure (SnapshotID origin start)
+
+  -- Save the current state of the observer
   () <- do
     me <- MonadActor.selfTID
     saved <- GenSState <$> SActorT MonadState.get
-    snapshotSetState snapshotID me saved
-  -- upsertSnapshot snapshotID $ \snapshot -> runIdentity $ _
-  _
+    snapshotSetState snapID me saved
+
+  -- For each actor `a`:
+  Vector.forM_ actors $ \actor -> do
+    -- Foobar
+
+    -- Send a "start snapshot" message to `a`.
+    me <- GenSMailbox <$> MonadActor.self
+    gsmSend actor (SMessageStart snapID me)
+
+
+  -- FIXME: doc
+  () <- do
+    let recurse :: Vector (STokens u, GenSMailbox u, msg) -> SActorT st msg u ()
+        recurse missed = do
+          -- If the "done" map associated with our snapshot is all 'True',
+          -- then the snapshot is finished.
+          internalRecv $ \(tokens, origin, msg) -> SActorT $ do
+            me <- MonadActor.self
+            let missed' = Vector.snoc missed (tokens, origin, msg)
+            finished <- Lens.use (snapshotsInSState . Lens.at snapID)
+                        >>= fmap (Lens.view doneInSystemSnapshot)
+                        .>  maybe False (Map.elems .> and)
+                        .>  pure
+            if finished
+              then Vector.forM_ missed'
+                   $ \(ts, o, m) -> MonadActor.send me (SMessageNormal ts o m)
+              else runSActorT (recurse missed')
+
+    -- Run `recurse` with an empty vector of missed messages to begin with.
+    recurse Vector.empty
+
+  -- The snapshot is now guaranteed to be finished, so we look it up in the
+  -- hashtable of snapshots. The assertion should never fail, but we cannot
+  -- guarantee this statically without much more complicated types.
+  SActorT (Lens.use (snapshotsInSState . Lens.at snapID))
+    >>= maybe (fail "assertion failed!") pure
 
 --------------------------------------------------------------------------------

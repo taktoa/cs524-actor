@@ -1,11 +1,13 @@
 --------------------------------------------------------------------------------
 
-{-# LANGUAGE ExistentialQuantification, TypeInType  #-}
+{-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE ExistentialQuantification  #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE FunctionalDependencies     #-}
 {-# LANGUAGE GADTSyntax                 #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE InstanceSigs               #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
@@ -13,6 +15,7 @@
 {-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE TypeFamilyDependencies     #-}
+{-# LANGUAGE TypeInType                 #-}
 
 --------------------------------------------------------------------------------
 
@@ -118,9 +121,11 @@ import qualified Control.Concurrent.Classy.MVar   as MVar
 
 -- Other stuff
 
-import Data.Kind (Type)
+import           Data.Kind                        (Type)
 
 import           Data.Proxy                       (Proxy (Proxy))
+
+import           Data.Functor.Contravariant       (Contravariant (contramap))
 
 import qualified Control.Lens                     as Lens
 
@@ -130,36 +135,41 @@ import           Flow                             ((.>), (|>))
 
 --------------------------------------------------------------------------------
 
-type TID m = MonadConc.ThreadId m
+type TID u = MonadConc.ThreadId u
 
 -- | FIXME: doc
-class ( Monad m, MonadState st m, MonadConc (Underlying m)
-      , Eq (Addr m), Ord (Addr m), Show (Addr m)
-      ) => MonadActor st msg m | m -> st, m -> msg where
+class ( Monad m, MonadState (S m) m, MonadConc (U m)
+      ) => MonadActor m where
 
   -- | FIXME: doc
-  type family Addr m :: Type
+  type family A m :: Type -> Type
 
   -- | FIXME: doc
-  type family Underlying m :: Type -> Type
+  type family S m :: Type
 
   -- | FIXME: doc
-  addrToTID :: proxy m -> Addr m -> TID (Underlying m)
+  type family M m :: Type
 
   -- | FIXME: doc
-  spawn :: st -> m () -> Underlying m (Addr m)
+  type family U m :: Type -> Type
 
   -- | FIXME: doc
-  self :: m (Addr m)
+  addrToTID :: proxy m -> A m a -> TID (U m)
 
   -- | FIXME: doc
-  send :: Addr m -> msg -> m ()
+  spawn :: S m -> m () -> U m (A m (M m))
 
   -- | FIXME: doc
-  recv :: (msg -> m a) -> m ()
+  self :: m (A m (M m))
+
+  -- | FIXME: doc
+  send :: forall msg. A m msg -> msg -> m ()
+
+  -- | FIXME: doc
+  recv :: (M m -> m a) -> m ()
 
 -- | FIXME: doc
-selfTID :: forall m st msg. (MonadActor st msg m) => m (TID (Underlying m))
+selfTID :: forall m. (MonadActor m) => m (TID (U m))
 selfTID = addrToTID (Proxy @m) <$> self
 
 --------------------------------------------------------------------------------
@@ -202,20 +212,32 @@ instance (MonadConc m) => MonadState st (ActorT st msg m) where
     var <- contextState <$> ActorT ReaderT.ask
     MonadTrans.lift (MVar.putMVar var value)
 
-data Mailbox m msg
+-- | FIXME: doc
+data Mailbox u msg
   = Mailbox
-    { mailboxThreadId :: !(MonadConc.ThreadId m)
-    , mailboxSend     :: !(msg -> m ())
+    { _mailboxThreadId :: !(TID u)
+    , _mailboxSend     :: !(msg -> u ())
     }
 
+-- | Given a function from @b -> a@, we can always construct a function from
+--   @'Mailbox' a -> 'Mailbox' b@, since a @'Mailbox' u msg@ is just a pair of
+--   a sender function @msg -> u ()@ and a @'TID' u@.
+instance Contravariant (Mailbox u) where
+  contramap f (Mailbox tid s) = Mailbox tid (f .> s)
+
 -- | The 'ActorT' monad is, of course, an instance of 'MonadActor'.
-instance (MonadConc m) => MonadActor st msg (ActorT st msg m) where
-  type Addr (ActorT st msg m) = Mailbox m msg
+instance forall st msg u. (MonadConc u) => MonadActor (ActorT st msg u) where
+  type A (ActorT st msg u) = Mailbox u
+  type S (ActorT st msg u) = st
+  type M (ActorT st msg u) = msg
+  type U (ActorT st msg u) = u
 
-  type Underlying (ActorT st msg m) = m
+  -- addrToTID :: proxy m -> A m a -> TID (U m)
+  addrToTID :: proxy m -> Mailbox u a -> TID u
+  addrToTID _ = _mailboxThreadId
 
-  addrToTID _ = mailboxThreadId
-
+  -- spawn :: S m -> m () -> U m (A m msg)
+  spawn :: st -> ActorT st msg u () -> u (Mailbox u msg)
   spawn initial (ActorT act) = do
     chan     <- Chan.newChan
     stateVar <- MVar.newMVar initial
@@ -225,14 +247,20 @@ instance (MonadConc m) => MonadActor st msg (ActorT st msg m) where
     tid <- MonadConc.fork (ReaderT.runReaderT act ctx)
     pure (Mailbox tid (Chan.writeChan chan))
 
+  -- self :: m (A m (M m))
+  self :: ActorT st msg u (Mailbox u msg)
   self = do
     chan <- ActorT (ReaderT.asks contextChan)
     tid <- MonadTrans.lift MonadConc.myThreadId
     pure (Mailbox tid (Chan.writeChan chan))
 
+  -- send :: forall message. A m message -> message -> m ()
+  send :: forall message. Mailbox u message -> message -> ActorT st msg u ()
   send addr msg = do
-    MonadTrans.lift $ mailboxSend addr msg
+    MonadTrans.lift $ _mailboxSend addr msg
 
+  -- recv :: (M m -> m a) -> m ()
+  recv :: (msg -> ActorT st msg u a) -> ActorT st msg u ()
   recv handler = do
     chan <- ActorT (ReaderT.asks contextChan)
     MonadTrans.lift (Chan.readChan chan) >>= handler
@@ -250,34 +278,13 @@ data Context st msg m
 
 --------------------------------------------------------------------------------
 
--- instance ( Eq (MonadConc.ThreadId m)
---          ) => Eq (Addr (ActorT st msg m)) where
-instance (MonadConc m) => Eq (Mailbox m msg) where
-  addr1 == addr2 = let tid1 = mailboxThreadId addr1
-                       tid2 = mailboxThreadId addr2
-                   in tid1 == tid2
-
--- instance ( Ord (MonadConc.ThreadId m)
---          ) => Ord (Addr (ActorT st msg m)) where
-instance (MonadConc m) => Ord (Mailbox m msg) where
-  compare addr1 addr2 = let tid1 = mailboxThreadId addr1
-                            tid2 = mailboxThreadId addr2
-                        in compare tid1 tid2
-
--- instance ( Show (MonadConc.ThreadId m)
---          ) => Show (Addr (ActorT st msg m)) where
-instance (MonadConc m) => Show (Mailbox m msg) where
-  show (Mailbox tid _) = "Mailbox(" ++ show tid ++ ")"
-
---------------------------------------------------------------------------------
-
 -- | Return the state from the internals of the monad.
 --
 --   This function is the same as 'MonadState.get' from
 --   "Control.Monad.State.Class", except it has a more specific type.
 get
-  :: (MonadActor st msg m)
-  => m st
+  :: (MonadActor m)
+  => m (S m)
   -- ^ An actor action that returns the current actor state.
 get = MonadState.get
 
@@ -286,8 +293,8 @@ get = MonadState.get
 --   This function is the same as 'MonadState.put' from
 --   "Control.Monad.State.Class", except it has a more specific type.
 put
-  :: (MonadActor st msg m)
-  => st
+  :: (MonadActor m)
+  => S m
   -- ^ The new state to which the actor state will be set.
   -> m ()
   -- ^ An actor action that sets the actor state to the new state.
@@ -298,8 +305,8 @@ put = MonadState.put
 --   This function is the same as 'MonadState.state' from
 --   "Control.Monad.State.Class", except it has a more specific type.
 state
-  :: (MonadActor st msg m)
-  => (st -> (ret, st))
+  :: (MonadActor m)
+  => (S m -> (ret, S m))
   -- ^ A function that, given the current state, returns an arbitrary value
   --   along with a new state.
   -> m ret
@@ -314,8 +321,8 @@ state = MonadState.state
 --   This function is the same as 'MonadState.modify' from
 --   "Control.Monad.State.Class", except it has a more specific type.
 modify
-  :: (MonadActor st msg m)
-  => (st -> st)
+  :: (MonadActor m)
+  => (S m -> S m)
   -- ^ A function from the state type to itself.
   -> m ()
   -- ^ An 'ActorT' action that replaces the state with the result of
@@ -325,8 +332,8 @@ modify = MonadState.modify
 -- | Convert a 'StateT' state transformer value to an 'ActorT' action that
 --   modifies the actor state using the state transformer.
 embedStateT
-  :: (Monad m, MonadActor st msg m)
-  => StateT st m ret
+  :: (Monad m, MonadActor m)
+  => StateT (S m) m ret
   -- ^ A monadic state transformer.
   -> m ret
   -- ^ An actor action that modifies the actor state using the
@@ -350,8 +357,8 @@ embedStateT action = do
 --     4. The actor state is set to @s'@.
 --     5. Finally, @ret@ is returned.
 embedST
-  :: (MonadActor st msg m)
-  => (forall s. STRef s st -> ST s ret)
+  :: (MonadActor m)
+  => (forall s. STRef s (S m) -> ST s ret)
   -- ^ An 'ST' action that can mutate the given 'STRef' and return an
   --   arbitrary value.
   -> m ret
