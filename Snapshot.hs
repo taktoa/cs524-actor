@@ -285,81 +285,6 @@ gssPut (GenSState state) = do
 
 --------------------------------------------------------------------------------
 
-type Spawned u = Map (MonadActor.TID u) (GenSMailbox u)
-
-newtype WithSpawned u a
-  = WithSpawned { fromWithSpawned :: StateT (Spawned u) u a }
-
-runWithSpawned :: (MonadConc u) => WithSpawned u a -> u a
-runWithSpawned (WithSpawned m) = StateT.evalStateT m mempty
-
-liftWS :: (Monad u) => u a -> WithSpawned u a
-liftWS = MonadTrans.lift .> WithSpawned
-
-deriving instance (Functor     u) => Functor     (WithSpawned u)
-deriving instance (Monad       u) => Applicative (WithSpawned u)
-deriving instance (Monad       u) => Monad       (WithSpawned u)
-deriving instance (MonadThrow  u) => MonadThrow  (WithSpawned u)
-deriving instance (MonadCatch  u) => MonadCatch  (WithSpawned u)
-deriving instance (MonadMask   u) => MonadMask   (WithSpawned u)
-
-instance (MonadConc u) => MonadConc (WithSpawned u) where
-  type STM      (WithSpawned u) = MonadConc.STM u
-  type MVar     (WithSpawned u) = MonadConc.MVar u
-  type CRef     (WithSpawned u) = MonadConc.CRef u
-  type Ticket   (WithSpawned u) = MonadConc.Ticket u
-  type ThreadId (WithSpawned u) = MonadConc.ThreadId u
-
-  fork (WithSpawned m) = WithSpawned (MonadConc.fork m)
-  forkOn i (WithSpawned m) = WithSpawned (MonadConc.forkOn i m)
-
-  forkWithUnmask        f = WithSpawned
-                            $ MonadConc.forkWithUnmask
-                            $ \g -> (fromWithSpawned
-                                     (f (fromWithSpawned .> g .> WithSpawned)))
-  forkWithUnmaskN   n   f = WithSpawned
-                            $ MonadConc.forkWithUnmaskN n
-                            $ \g -> (fromWithSpawned
-                                     (f (fromWithSpawned .> g .> WithSpawned)))
-  forkOnWithUnmask    i f = WithSpawned
-                            $ MonadConc.forkOnWithUnmask i
-                            $ \g -> (fromWithSpawned
-                                     (f (fromWithSpawned .> g .> WithSpawned)))
-  forkOnWithUnmaskN n i f = WithSpawned
-                            $ MonadConc.forkOnWithUnmaskN n i
-                            $ \g -> (fromWithSpawned
-                                     (f (fromWithSpawned .> g .> WithSpawned)))
-
-  getNumCapabilities = liftWS MonadConc.getNumCapabilities
-  setNumCapabilities = liftWS . MonadConc.setNumCapabilities
-  myThreadId         = liftWS MonadConc.myThreadId
-  yield              = liftWS MonadConc.yield
-  threadDelay        = liftWS . MonadConc.threadDelay
-  throwTo t          = liftWS . MonadConc.throwTo t
-  newEmptyMVar       = liftWS MonadConc.newEmptyMVar
-  newEmptyMVarN      = liftWS . MonadConc.newEmptyMVarN
-  readMVar           = liftWS . MonadConc.readMVar
-  tryReadMVar        = liftWS . MonadConc.tryReadMVar
-  putMVar v          = liftWS . MonadConc.putMVar v
-  tryPutMVar v       = liftWS . MonadConc.tryPutMVar v
-  takeMVar           = liftWS . MonadConc.takeMVar
-  tryTakeMVar        = liftWS . MonadConc.tryTakeMVar
-  newCRef            = liftWS . MonadConc.newCRef
-  newCRefN n         = liftWS . MonadConc.newCRefN n
-  readCRef           = liftWS . MonadConc.readCRef
-  atomicModifyCRef r = liftWS . MonadConc.atomicModifyCRef r
-  writeCRef r        = liftWS . MonadConc.writeCRef r
-  atomicWriteCRef r  = liftWS . MonadConc.atomicWriteCRef r
-  readForCAS         = liftWS . MonadConc.readForCAS
-  peekTicket' _      = MonadConc.peekTicket' (Proxy :: Proxy u)
-  casCRef r t        = liftWS . MonadConc.casCRef r t
-  modifyCRefCAS r    = liftWS . MonadConc.modifyCRefCAS r
-  modifyCRefCAS_ r   = liftWS . MonadConc.modifyCRefCAS_ r
-  atomically         = liftWS . MonadConc.atomically
-  readTVarConc       = liftWS . MonadConc.readTVarConc
-
---------------------------------------------------------------------------------
-
 newtype SActorT st msg u ret
   = SActorT
     { runSActorT :: VCActorT (SState u st) (SMessage u msg) u ret }
@@ -385,16 +310,14 @@ instance ( MonadConc u, Typeable st, Typeable msg
   type A (SActorT st msg u) = SMailbox u
   type S (SActorT st msg u) = st
   type M (SActorT st msg u) = msg
-  type U (SActorT st msg u) = WithSpawned u
+  type U (SActorT st msg u) = u
 
   addrToTID _ = (\(SMailbox mb) -> mb)
                 .> (MonadActor.addrToTID
                     (Proxy @(VCActorT (SState u st) (SMessage u msg) u)))
 
   spawn initial (SActorT act) = do
-    mb <- liftWS (SMailbox <$> MonadActor.spawn (initialSState initial) act)
-    WithSpawned (MonadState.modify (Map.insert _ _))
-    pure mb
+    SMailbox <$> MonadActor.spawn (initialSState initial) act
 
   self = SMailbox <$> SActorT MonadActor.self
 
@@ -628,6 +551,6 @@ restore :: forall st msg u.
            (MonadConc u, Typeable st, Typeable msg)
         => SystemSnapshot u
         -> SActorT st msg u ()
-restore = _
+restore = undefined
 
 --------------------------------------------------------------------------------
